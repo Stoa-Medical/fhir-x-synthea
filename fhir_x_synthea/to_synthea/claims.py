@@ -1,8 +1,11 @@
-"""
-Mapping function for converting FHIR Claim resources to Synthea claims.csv rows.
-"""
+"""FHIR R4 Claim → Synthea Claim"""
 
+import logging
+from datetime import date
 from typing import Any
+
+from fhir.resources.claim import Claim
+from synthea_pydantic import Claim as SyntheaClaim
 
 from ..synthea_csv_lib import (
     extract_extension_string,
@@ -10,82 +13,58 @@ from ..synthea_csv_lib import (
     parse_datetime_to_date,
 )
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_claim_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a FHIR R4 Claim resource to a Synthea claims.csv row.
+
+def _find_event_by_code(events: list[dict[str, Any]], event_code: str) -> date | None:
+    """Find event by type code and return its date."""
+    for event in events:
+        event_type = event.get("type", {})
+        codings = event_type.get("coding", [])
+        for coding in codings:
+            code = coding.get("code", "")
+            if code == event_code:
+                when = event.get("whenDateTime")
+                if when:
+                    parsed = parse_datetime_to_date(when)
+                    if parsed:
+                        return date.fromisoformat(parsed)
+    return None
+
+
+def convert(src: Claim) -> SyntheaClaim:
+    """Convert FHIR R4 Claim to Synthea Claim.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR Claim resource
+        src: FHIR R4 Claim resource
 
     Returns:
-        Dictionary with CSV column names as keys
+        Synthea Claim model
+
+    Note:
+        Some FHIR fields may not be representable in Synthea format.
+        Check logs for warnings about dropped data.
     """
-
-    # Helper to find event by type code
-    def find_event_by_code(events: list[dict[str, Any]], event_code: str) -> str:
-        for event in events:
-            event_type = event.get("type", {})
-            codings = event_type.get("coding", [])
-            for coding in codings:
-                code = coding.get("code", "")
-                if code == event_code:
-                    when = event.get("whenDateTime")
-                    if when:
-                        return parse_datetime_to_date(when)
-        return ""
-
-    # Initialize CSV row
-    csv_row: dict[str, str] = {
-        "Id": "",
-        "Patient ID": "",
-        "Provider ID": "",
-        "Primary Patient Insurance ID": "",
-        "Secondary Patient Insurance ID": "",
-        "Department ID": "",
-        "Patient Department ID": "",
-        "Diagnosis1": "",
-        "Diagnosis2": "",
-        "Diagnosis3": "",
-        "Diagnosis4": "",
-        "Diagnosis5": "",
-        "Diagnosis6": "",
-        "Diagnosis7": "",
-        "Diagnosis8": "",
-        "Referring Provider ID": "",
-        "Appointment ID": "",
-        "Current Illness Date": "",
-        "Service Date": "",
-        "Supervising Provider ID": "",
-        "Status1": "",
-        "Status2": "",
-        "StatusP": "",
-        "Outstanding1": "",
-        "Outstanding2": "",
-        "OutstandingP": "",
-        "LastBilledDate1": "",
-        "LastBilledDate2": "",
-        "LastBilledDateP": "",
-        "HealthcareClaimTypeID1": "",
-        "HealthcareClaimTypeID2": "",
-    }
+    fhir_resource = src.model_dump(exclude_none=True)
 
     # Extract Id
     resource_id = fhir_resource.get("id", "")
-    if resource_id:
-        csv_row["Id"] = resource_id
 
     # Extract Patient ID
+    patient_id = ""
     patient = fhir_resource.get("patient")
     if patient:
-        csv_row["Patient ID"] = extract_reference_id(patient)
+        patient_id = extract_reference_id(patient)
 
     # Extract Provider ID
+    provider_id = ""
     provider = fhir_resource.get("provider")
     if provider:
-        csv_row["Provider ID"] = extract_reference_id(provider)
+        provider_id = extract_reference_id(provider)
 
     # Extract Insurance (Primary and Secondary)
+    primary_insurance_id = ""
+    secondary_insurance_id = ""
     insurance_list = fhir_resource.get("insurance", [])
     for i, insurance in enumerate(insurance_list[:2]):
         coverage = insurance.get("coverage")
@@ -95,31 +74,21 @@ def map_fhir_claim_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
             focal = insurance.get("focal", sequence == 1)
 
             if sequence == 1 or focal:
-                csv_row["Primary Patient Insurance ID"] = coverage_id
+                primary_insurance_id = coverage_id
             elif sequence == 2 or not focal:
-                csv_row["Secondary Patient Insurance ID"] = coverage_id
+                secondary_insurance_id = coverage_id
 
     # Extract Department IDs from extensions
-    csv_row["Department ID"] = extract_extension_string(
+    department_id = extract_extension_string(
         fhir_resource, "http://synthea.tools/StructureDefinition/department-id"
     )
-    csv_row["Patient Department ID"] = extract_extension_string(
+    patient_department_id = extract_extension_string(
         fhir_resource, "http://synthea.tools/StructureDefinition/patient-department-id"
     )
 
     # Extract Diagnosis codes (up to 8)
     diagnoses = fhir_resource.get("diagnosis", [])
-    diagnosis_indices = [
-        "Diagnosis1",
-        "Diagnosis2",
-        "Diagnosis3",
-        "Diagnosis4",
-        "Diagnosis5",
-        "Diagnosis6",
-        "Diagnosis7",
-        "Diagnosis8",
-    ]
-
+    diagnosis_codes = ["", "", "", "", "", "", "", ""]
     for i, diagnosis in enumerate(diagnoses[:8]):
         diagnosis_codeable = diagnosis.get("diagnosisCodeableConcept", {})
         codings = diagnosis_codeable.get("coding", [])
@@ -133,34 +102,41 @@ def map_fhir_claim_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
             if not code and codings:
                 code = codings[0].get("code", "")
             if code:
-                csv_row[diagnosis_indices[i]] = code
+                diagnosis_codes[i] = code
 
     # Extract Appointment ID from item
+    appointment_id = ""
     items = fhir_resource.get("item", [])
     if items:
         first_item = items[0]
         encounters = first_item.get("encounter", [])
         if encounters:
             first_encounter = encounters[0]
-            csv_row["Appointment ID"] = extract_reference_id(first_encounter)
+            appointment_id = extract_reference_id(first_encounter)
 
     # Extract events
     events = fhir_resource.get("event", [])
-    csv_row["Current Illness Date"] = find_event_by_code(events, "onset")
-    csv_row["LastBilledDate1"] = find_event_by_code(events, "bill-primary")
-    csv_row["LastBilledDate2"] = find_event_by_code(events, "bill-secondary")
-    csv_row["LastBilledDateP"] = find_event_by_code(events, "bill-patient")
+    current_illness_date = _find_event_by_code(events, "onset")
+    last_billed_date1 = _find_event_by_code(events, "bill-primary")
+    last_billed_date2 = _find_event_by_code(events, "bill-secondary")
+    last_billed_datep = _find_event_by_code(events, "bill-patient")
 
     # Extract Service Date from billablePeriod
+    service_date = None
     billable_period = fhir_resource.get("billablePeriod", {})
     start = billable_period.get("start")
     end = billable_period.get("end")
     if start:
-        csv_row["Service Date"] = parse_datetime_to_date(start)
+        parsed = parse_datetime_to_date(start)
+        if parsed:
+            service_date = date.fromisoformat(parsed)
     elif end:
-        csv_row["Service Date"] = parse_datetime_to_date(end)
+        parsed = parse_datetime_to_date(end)
+        if parsed:
+            service_date = date.fromisoformat(parsed)
 
     # Extract Supervising Provider from careTeam
+    supervising_provider_id = ""
     care_team = fhir_resource.get("careTeam", [])
     for team_member in care_team:
         role = team_member.get("role", {})
@@ -168,27 +144,83 @@ def map_fhir_claim_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
         if role_text == "supervising":
             provider_ref = team_member.get("provider")
             if provider_ref:
-                csv_row["Supervising Provider ID"] = extract_reference_id(provider_ref)
+                supervising_provider_id = extract_reference_id(provider_ref)
                 break
 
     # Extract Claim Type
+    healthcare_claim_type_id1 = ""
+    healthcare_claim_type_id2 = ""
     claim_type = fhir_resource.get("type", {})
     type_codings = claim_type.get("coding", [])
     for coding in type_codings:
         code = coding.get("code", "")
         if code == "professional":
-            csv_row["HealthcareClaimTypeID1"] = "1"
+            healthcare_claim_type_id1 = "1"
         elif code == "institutional":
-            csv_row["HealthcareClaimTypeID1"] = "2"
+            healthcare_claim_type_id1 = "2"
         break
 
     # Extract SubType
     sub_type = fhir_resource.get("subType", {})
     sub_type_codings = sub_type.get("coding", [])
     if sub_type_codings:
-        csv_row["HealthcareClaimTypeID2"] = sub_type_codings[0].get("code", "")
+        healthcare_claim_type_id2 = sub_type_codings[0].get("code", "")
 
-    # Note: Status1/Status2/StatusP and Outstanding1/2/P are not on Claim
-    # They would need to come from ClaimResponse if available
+    # Note: Status1/Status2/StatusP and Outstanding1/2/P from notes
+    # These would need parsing from note text if present
+    status1 = ""
+    status2 = ""
+    statusp = ""
+    outstanding1 = ""
+    outstanding2 = ""
+    outstandingp = ""
 
-    return csv_row
+    notes = fhir_resource.get("note", [])
+    for note in notes:
+        text = note.get("text", "")
+        if text.startswith("Outstanding:"):
+            # This is a simplified extraction
+            pass
+
+    # Log lossy conversions
+    if len(diagnoses) > 8:
+        logger.warning(
+            "Claim %s has %d diagnoses; only first 8 preserved",
+            src.id,
+            len(diagnoses),
+        )
+
+    return SyntheaClaim(
+        id=resource_id or None,
+        patientid=patient_id or None,
+        providerid=provider_id or None,
+        primarypatientinsuranceid=primary_insurance_id or None,
+        secondarypatientinsuranceid=secondary_insurance_id or None,
+        departmentid=department_id or None,
+        patientdepartmentid=patient_department_id or None,
+        diagnosis1=diagnosis_codes[0] or None,
+        diagnosis2=diagnosis_codes[1] or None,
+        diagnosis3=diagnosis_codes[2] or None,
+        diagnosis4=diagnosis_codes[3] or None,
+        diagnosis5=diagnosis_codes[4] or None,
+        diagnosis6=diagnosis_codes[5] or None,
+        diagnosis7=diagnosis_codes[6] or None,
+        diagnosis8=diagnosis_codes[7] or None,
+        referringproviderid=None,  # Not in FHIR Claim
+        appointmentid=appointment_id or None,
+        currentillnessdate=current_illness_date,
+        servicedate=service_date,
+        supervisingproviderid=supervising_provider_id or None,
+        status1=status1 or None,
+        status2=status2 or None,
+        statusp=statusp or None,
+        outstanding1=outstanding1 or None,
+        outstanding2=outstanding2 or None,
+        outstandingp=outstandingp or None,
+        lastbilleddate1=last_billed_date1,
+        lastbilleddate2=last_billed_date2,
+        lastbilleddatep=last_billed_datep,
+        healthcareclaimtypeid1=healthcare_claim_type_id1 or None,
+        healthcareclaimtypeid2=healthcare_claim_type_id2 or None,
+        healthcareclaimtypeidp=None,  # Not commonly used
+    )

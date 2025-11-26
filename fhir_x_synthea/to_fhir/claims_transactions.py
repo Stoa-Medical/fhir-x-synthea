@@ -1,116 +1,54 @@
-"""
-Mapping functions for converting Synthea claims_transactions.csv rows to FHIR Claim and ClaimResponse resources.
-"""
+"""Synthea ClaimTransaction → FHIR R4 Claim and ClaimResponse"""
 
 from typing import Any
 
+from fhir.resources.claim import Claim
+from fhir.resources.claimresponse import ClaimResponse
+from synthea_pydantic import ClaimTransaction
+
 from ..fhir_lib import create_reference, format_datetime
+from ..utils import to_str
 
 
-def map_claim_from_transaction(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea claims_transactions.csv row to a FHIR R4 Claim resource (skeleton).
+def convert(src: ClaimTransaction) -> Claim:
+    """Convert Synthea ClaimTransaction to FHIR R4 Claim.
 
     Args:
-        csv_row: Dictionary with keys from claims_transactions.csv
+        src: Synthea ClaimTransaction model
 
     Returns:
-        Dictionary representing a FHIR Claim resource
+        FHIR R4 Claim resource (skeleton based on transaction data)
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    claim_id = csv_row.get("Claim ID", "").strip() if csv_row.get("Claim ID") else ""
-    transaction_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    patient_id = (
-        csv_row.get("Patient ID", "").strip() if csv_row.get("Patient ID") else ""
-    )
-    place_of_service_id = (
-        csv_row.get("Place of Service", "").strip()
-        if csv_row.get("Place of Service")
-        else ""
-    )
-    provider_id = (
-        csv_row.get("Provider ID", "").strip() if csv_row.get("Provider ID") else ""
-    )
-    from_date = csv_row.get("From Date", "").strip() if csv_row.get("From Date") else ""
-    to_date = csv_row.get("To Date", "").strip() if csv_row.get("To Date") else ""
-    appointment_id = (
-        csv_row.get("Appointment ID", "").strip()
-        if csv_row.get("Appointment ID")
-        else ""
-    )
-    procedure_code = (
-        csv_row.get("Procedure Code", "").strip()
-        if csv_row.get("Procedure Code")
-        else ""
-    )
-    notes = csv_row.get("Notes", "").strip() if csv_row.get("Notes") else ""
-    line_note = csv_row.get("Line Note", "").strip() if csv_row.get("Line Note") else ""
-    supervising_provider_id = (
-        csv_row.get("Supervising Provider ID", "").strip()
-        if csv_row.get("Supervising Provider ID")
-        else ""
-    )
-    patient_insurance_id = (
-        csv_row.get("Patient Insurance ID", "").strip()
-        if csv_row.get("Patient Insurance ID")
-        else ""
-    )
-    department_id = (
-        csv_row.get("Department ID", "").strip() if csv_row.get("Department ID") else ""
-    )
-    fee_schedule_id = (
-        csv_row.get("Fee Schedule ID", "").strip()
-        if csv_row.get("Fee Schedule ID")
-        else ""
-    )
+    # Extract and process fields (synthea_pydantic uses lowercase keys)
+    claim_id = to_str(d.get("claimid"))
+    transaction_id = to_str(d.get("id"))
+    patient_id = to_str(d.get("patientid"))
+    place_of_service_id = to_str(d.get("placeofservice"))
+    provider_id = to_str(d.get("providerid"))
+    from_date = to_str(d.get("fromdate"))
+    to_date = to_str(d.get("todate"))
+    appointment_id = to_str(d.get("appointmentid"))
+    procedure_code = to_str(d.get("procedurecode"))
+    notes = to_str(d.get("notes"))
+    line_note = to_str(d.get("linenote"))
+    supervising_provider_id = to_str(d.get("supervisingproviderid"))
+    patient_insurance_id = to_str(d.get("patientinsuranceid"))
+    department_id = to_str(d.get("departmentid"))
+    fee_schedule_id = to_str(d.get("feescheduleid"))
 
     # Parse numeric fields
-    charge_id_str = (
-        csv_row.get("Charge ID", "").strip() if csv_row.get("Charge ID") else ""
-    )
-    units_str = csv_row.get("Units", "").strip() if csv_row.get("Units") else ""
-    unit_amount_str = (
-        csv_row.get("Unit Amount", "").strip() if csv_row.get("Unit Amount") else ""
-    )
-    amount_str = csv_row.get("Amount", "").strip() if csv_row.get("Amount") else ""
+    charge_id = d.get("chargeid")
+    units = d.get("units")
+    unit_amount = d.get("unitamount")
+    amount = d.get("amount")
 
-    charge_id = None
-    if charge_id_str:
-        try:
-            charge_id = int(charge_id_str)
-        except (ValueError, TypeError):
-            pass
-
-    units = None
-    if units_str:
-        try:
-            units = float(units_str)
-        except (ValueError, TypeError):
-            pass
-
-    unit_amount = None
-    if unit_amount_str:
-        try:
-            unit_amount = float(unit_amount_str)
-        except (ValueError, TypeError):
-            pass
-
-    amount = None
-    if amount_str:
-        try:
-            amount = float(amount_str)
-        except (ValueError, TypeError):
-            pass
-
-    # Extract diagnosis references (DiagnosisRef1-4)
+    # Extract diagnosis references (diagnosisref1-4)
     diagnosis_sequences = []
     for i in range(1, 5):
-        diag_ref_key = f"DiagnosisRef{i}"
-        diag_ref = (
-            csv_row.get(diag_ref_key, "").strip() if csv_row.get(diag_ref_key) else ""
-        )
-        if diag_ref:
+        diag_ref = d.get(f"diagnosisref{i}")
+        if diag_ref is not None:
             try:
                 diagnosis_sequences.append(int(diag_ref))
             except (ValueError, TypeError):
@@ -119,8 +57,28 @@ def map_claim_from_transaction(csv_row: dict[str, Any]) -> dict[str, Any]:
     # Build base resource
     resource: dict[str, Any] = {
         "resourceType": "Claim",
-        "id": claim_id if claim_id else "",
+        "status": "active",
+        "use": "claim",
+        "type": {
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/claim-type",
+                    "code": "professional",
+                }
+            ]
+        },
+        "priority": {
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/processpriority",
+                    "code": "normal",
+                }
+            ]
+        },
     }
+
+    if claim_id:
+        resource["id"] = claim_id
 
     # Set patient reference
     if patient_id:
@@ -157,21 +115,27 @@ def map_claim_from_transaction(csv_row: dict[str, Any]) -> dict[str, Any]:
     if patient_insurance_id:
         insurance_ref = create_reference("Coverage", patient_insurance_id)
         if insurance_ref:
-            resource["insurance"] = [{"coverage": insurance_ref}]
+            resource["insurance"] = [
+                {"sequence": 1, "focal": True, "coverage": insurance_ref}
+            ]
 
     # Set careTeam (supervising provider)
     if supervising_provider_id:
         provider_ref = create_reference("Practitioner", supervising_provider_id)
         if provider_ref:
             resource["careTeam"] = [
-                {"provider": provider_ref, "role": {"text": "supervising"}}
+                {
+                    "sequence": 1,
+                    "provider": provider_ref,
+                    "role": {"text": "supervising"},
+                }
             ]
 
     # Set item
-    item: dict[str, Any] = {}
+    item: dict[str, Any] = {"sequence": 1}
 
     if charge_id is not None:
-        item["sequence"] = charge_id
+        item["sequence"] = int(charge_id)
 
     # Encounter reference
     if appointment_id:
@@ -186,18 +150,20 @@ def map_claim_from_transaction(csv_row: dict[str, Any]) -> dict[str, Any]:
         }
         if line_note:
             item["productOrService"]["coding"][0]["display"] = line_note
+    else:
+        item["productOrService"] = {"text": "Service"}
 
     # Quantity
     if units is not None:
-        item["quantity"] = {"value": units}
+        item["quantity"] = {"value": float(units)}
 
     # Unit price
     if unit_amount is not None:
-        item["unitPrice"] = {"value": unit_amount}
+        item["unitPrice"] = {"value": float(unit_amount), "currency": "USD"}
 
     # Net amount
     if amount is not None:
-        item["net"] = {"value": amount}
+        item["net"] = {"value": float(amount), "currency": "USD"}
 
     # Diagnosis sequence
     if diagnosis_sequences:
@@ -221,8 +187,7 @@ def map_claim_from_transaction(csv_row: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    if item:
-        resource["item"] = [item]
+    resource["item"] = [item]
 
     # Set notes
     claim_notes = []
@@ -233,100 +198,56 @@ def map_claim_from_transaction(csv_row: dict[str, Any]) -> dict[str, Any]:
     if claim_notes:
         resource["note"] = claim_notes
 
-    return resource
+    return Claim(**resource)
 
 
-def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea claims_transactions.csv row to a FHIR R4 ClaimResponse resource.
+def convert_response(src: ClaimTransaction) -> ClaimResponse:
+    """Convert Synthea ClaimTransaction to FHIR R4 ClaimResponse.
 
     Args:
-        csv_row: Dictionary with keys from claims_transactions.csv
+        src: Synthea ClaimTransaction model
 
     Returns:
-        Dictionary representing a FHIR ClaimResponse resource
+        FHIR R4 ClaimResponse resource
     """
+    d = src.model_dump()
 
     # Extract and process fields
-    transaction_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    claim_id = csv_row.get("Claim ID", "").strip() if csv_row.get("Claim ID") else ""
-    patient_id = (
-        csv_row.get("Patient ID", "").strip() if csv_row.get("Patient ID") else ""
-    )
-    patient_insurance_id = (
-        csv_row.get("Patient Insurance ID", "").strip()
-        if csv_row.get("Patient Insurance ID")
-        else ""
-    )
-    transaction_type = csv_row.get("Type", "").strip() if csv_row.get("Type") else ""
-    method = csv_row.get("Method", "").strip() if csv_row.get("Method") else ""
-    to_date = csv_row.get("To Date", "").strip() if csv_row.get("To Date") else ""
-    transfer_out_id = (
-        csv_row.get("Transfer Out ID", "").strip()
-        if csv_row.get("Transfer Out ID")
-        else ""
-    )
-    transfer_type = (
-        csv_row.get("Transfer Type", "").strip() if csv_row.get("Transfer Type") else ""
-    )
+    transaction_id = to_str(d.get("id"))
+    claim_id = to_str(d.get("claimid"))
+    patient_id = to_str(d.get("patientid"))
+    patient_insurance_id = to_str(d.get("patientinsuranceid"))
+    transaction_type = to_str(d.get("type"))
+    method = to_str(d.get("method"))
+    to_date = to_str(d.get("todate"))
+    transfer_out_id = to_str(d.get("transferoutid"))
+    transfer_type = to_str(d.get("transfertype"))
 
     # Parse numeric fields
-    charge_id_str = (
-        csv_row.get("Charge ID", "").strip() if csv_row.get("Charge ID") else ""
-    )
-    payments_str = (
-        csv_row.get("Payments", "").strip() if csv_row.get("Payments") else ""
-    )
-    adjustments_str = (
-        csv_row.get("Adjustments", "").strip() if csv_row.get("Adjustments") else ""
-    )
-    transfers_str = (
-        csv_row.get("Transfers", "").strip() if csv_row.get("Transfers") else ""
-    )
-    outstanding_str = (
-        csv_row.get("Outstanding", "").strip() if csv_row.get("Outstanding") else ""
-    )
-
-    charge_id = None
-    if charge_id_str:
-        try:
-            charge_id = int(charge_id_str)
-        except (ValueError, TypeError):
-            pass
-
-    payments = None
-    if payments_str:
-        try:
-            payments = float(payments_str)
-        except (ValueError, TypeError):
-            pass
-
-    adjustments = None
-    if adjustments_str:
-        try:
-            adjustments = float(adjustments_str)
-        except (ValueError, TypeError):
-            pass
-
-    transfers = None
-    if transfers_str:
-        try:
-            transfers = float(transfers_str)
-        except (ValueError, TypeError):
-            pass
-
-    outstanding = None
-    if outstanding_str:
-        try:
-            outstanding = float(outstanding_str)
-        except (ValueError, TypeError):
-            pass
+    charge_id = d.get("chargeid")
+    payments = d.get("payments")
+    adjustments = d.get("adjustments")
+    transfers = d.get("transfers")
+    outstanding = d.get("outstanding")
 
     # Build base resource
     resource: dict[str, Any] = {
         "resourceType": "ClaimResponse",
-        "id": transaction_id if transaction_id else "",
+        "status": "active",
+        "use": "claim",
+        "type": {
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/claim-type",
+                    "code": "professional",
+                }
+            ]
+        },
+        "outcome": "complete",
     }
+
+    if transaction_id:
+        resource["id"] = transaction_id
 
     # Set request reference
     if claim_id:
@@ -340,15 +261,20 @@ def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
         if patient_ref:
             resource["patient"] = patient_ref
 
+    # Set insurer (required in R4B)
+    resource["insurer"] = {"display": "Unknown Insurer"}
+
     # Set insurance
     if patient_insurance_id:
         insurance_ref = create_reference("Coverage", patient_insurance_id)
         if insurance_ref:
-            resource["insurance"] = [{"coverage": insurance_ref}]
+            resource["insurance"] = [
+                {"sequence": 1, "focal": True, "coverage": insurance_ref}
+            ]
 
     # Set item with adjudication
     if charge_id is not None:
-        item: dict[str, Any] = {"itemSequence": charge_id, "adjudication": []}
+        item: dict[str, Any] = {"itemSequence": int(charge_id), "adjudication": []}
 
         # Build adjudications based on transaction type
         if transaction_type:
@@ -363,7 +289,7 @@ def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
                 item["adjudication"].append(
                     {
                         "category": {"coding": [category_coding]},
-                        "amount": {"value": payments},
+                        "amount": {"value": float(payments), "currency": "USD"},
                     }
                 )
 
@@ -374,7 +300,7 @@ def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
                         "category": {
                             "coding": [{**category_coding, "code": "adjustment"}]
                         },
-                        "amount": {"value": adjustments},
+                        "amount": {"value": float(adjustments), "currency": "USD"},
                     }
                 )
 
@@ -385,7 +311,7 @@ def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
             ):
                 transfer_adjudication: dict[str, Any] = {
                     "category": {"coding": [{**category_coding, "code": "transfer"}]},
-                    "amount": {"value": transfers},
+                    "amount": {"value": float(transfers), "currency": "USD"},
                 }
 
                 # Add transfer details as reason
@@ -410,12 +336,28 @@ def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
         if outstanding is not None:
             item["note"] = [{"text": f"Outstanding: {outstanding}"}]
 
-        if item.get("adjudication") or item.get("note"):
-            resource["item"] = [item]
+        # Ensure at least one adjudication for valid structure
+        if not item["adjudication"]:
+            item["adjudication"].append(
+                {
+                    "category": {
+                        "coding": [
+                            {
+                                "system": "http://terminology.hl7.org/CodeSystem/adjudication",
+                                "code": "submitted",
+                            }
+                        ]
+                    },
+                }
+            )
+
+        resource["item"] = [item]
 
     # Set payment
     if payments is not None and transaction_type == "PAYMENT":
-        payment: dict[str, Any] = {"amount": {"value": payments}}
+        payment: dict[str, Any] = {
+            "amount": {"value": float(payments), "currency": "USD"}
+        }
 
         if method:
             payment["type"] = {
@@ -434,4 +376,4 @@ def map_claim_response(csv_row: dict[str, Any]) -> dict[str, Any]:
 
         resource["payment"] = payment
 
-    return resource
+    return ClaimResponse(**resource)

@@ -1,152 +1,59 @@
-"""
-Mapping function for converting Synthea payers.csv rows to FHIR Organization resources.
-"""
+"""Synthea Payer → FHIR R4 Organization (Insurance)"""
 
-import re
 from typing import Any
 
+from fhir.resources.organization import Organization
+from synthea_pydantic import Payer as SyntheaPayer
 
-def map_payer(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea payers.csv row to a FHIR R4 Organization resource representing a payer.
+from ..utils import split_phones, to_str
+
+
+def convert(src: SyntheaPayer) -> Organization:
+    """Convert Synthea Payer to FHIR R4 Organization (insurance type).
 
     Args:
-        csv_row: Dictionary with keys like Id, Name, Ownership, Address, City,
-                State_Headquartered, Zip, Phone, Amount_Covered, Amount_Uncovered,
-                Revenue, Covered_Encounters, Uncovered_Encounters, etc.
+        src: Synthea Payer model
 
     Returns:
-        Dictionary representing a FHIR Organization resource
+        FHIR R4 Organization resource with insurance type
     """
+    d = src.model_dump()
 
-    # Helper to split phone numbers
-    def split_phones(phone_str: str | None) -> list[str]:
-        if not phone_str or phone_str.strip() == "":
-            return []
-        phones = re.split(r"[,;/|]", phone_str)
-        return [p.strip() for p in phones if p.strip()]
+    # Extract fields
+    payer_id = to_str(d.get("id"))
+    name = to_str(d.get("name"))
+    address = to_str(d.get("address"))
+    city = to_str(d.get("city"))
+    state = to_str(d.get("state_headquartered"))
+    zip_code = to_str(d.get("zip"))
+    phone_str = to_str(d.get("phone"))
 
-    # Extract and process fields
-    payer_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    name = csv_row.get("Name", "").strip() if csv_row.get("Name") else ""
-    ownership = csv_row.get("Ownership", "").strip() if csv_row.get("Ownership") else ""
-    address = csv_row.get("Address", "").strip() if csv_row.get("Address") else ""
-    city = csv_row.get("City", "").strip() if csv_row.get("City") else ""
-    state = (
-        csv_row.get("State_Headquartered", "").strip()
-        if csv_row.get("State_Headquartered")
-        else ""
-    )
-    zip_code = csv_row.get("Zip", "").strip() if csv_row.get("Zip") else ""
-    phone_str = csv_row.get("Phone", "").strip() if csv_row.get("Phone") else ""
+    # Handle numeric stats fields
+    amount_covered = d.get("amount_covered")
+    amount_uncovered = d.get("amount_uncovered")
+    revenue = d.get("revenue")
+    covered_encounters = d.get("covered_encounters")
+    uncovered_encounters = d.get("uncovered_encounters")
+    covered_medications = d.get("covered_medications")
+    uncovered_medications = d.get("uncovered_medications")
+    covered_procedures = d.get("covered_procedures")
+    uncovered_procedures = d.get("uncovered_procedures")
+    covered_immunizations = d.get("covered_immunizations")
+    uncovered_immunizations = d.get("uncovered_immunizations")
+    unique_customers = d.get("unique_customers")
+    qols_avg = d.get("qols_avg")
+    member_months = d.get("member_months")
 
-    # Extract all stats fields
-    amount_covered_str = (
-        csv_row.get("Amount_Covered", "").strip()
-        if csv_row.get("Amount_Covered")
-        else ""
-    )
-    amount_uncovered_str = (
-        csv_row.get("Amount_Uncovered", "").strip()
-        if csv_row.get("Amount_Uncovered")
-        else ""
-    )
-    revenue_str = csv_row.get("Revenue", "").strip() if csv_row.get("Revenue") else ""
-    covered_encounters_str = (
-        csv_row.get("Covered_Encounters", "").strip()
-        if csv_row.get("Covered_Encounters")
-        else ""
-    )
-    uncovered_encounters_str = (
-        csv_row.get("Uncovered_Encounters", "").strip()
-        if csv_row.get("Uncovered_Encounters")
-        else ""
-    )
-    covered_medications_str = (
-        csv_row.get("Covered_Medications", "").strip()
-        if csv_row.get("Covered_Medications")
-        else ""
-    )
-    uncovered_medications_str = (
-        csv_row.get("Uncovered_Medications", "").strip()
-        if csv_row.get("Uncovered_Medications")
-        else ""
-    )
-    covered_procedures_str = (
-        csv_row.get("Covered_Procedures", "").strip()
-        if csv_row.get("Covered_Procedures")
-        else ""
-    )
-    uncovered_procedures_str = (
-        csv_row.get("Uncovered_Procedures", "").strip()
-        if csv_row.get("Uncovered_Procedures")
-        else ""
-    )
-    covered_immunizations_str = (
-        csv_row.get("Covered_Immunizations", "").strip()
-        if csv_row.get("Covered_Immunizations")
-        else ""
-    )
-    uncovered_immunizations_str = (
-        csv_row.get("Uncovered_Immunizations", "").strip()
-        if csv_row.get("Uncovered_Immunizations")
-        else ""
-    )
-    unique_customers_str = (
-        csv_row.get("Unique_Customers", "").strip()
-        if csv_row.get("Unique_Customers")
-        else ""
-    )
-    qols_avg_str = (
-        csv_row.get("QOLS_Avg", "").strip() if csv_row.get("QOLS_Avg") else ""
-    )
-    member_months_str = (
-        csv_row.get("Member_Months", "").strip() if csv_row.get("Member_Months") else ""
-    )
+    # Build resource
+    resource: dict[str, Any] = {"resourceType": "Organization"}
 
-    # Parse numeric stats fields
-    def parse_decimal(value_str: str) -> float | None:
-        if not value_str:
-            return None
-        try:
-            return float(value_str)
-        except (ValueError, TypeError):
-            return None
+    if payer_id:
+        resource["id"] = payer_id
 
-    def parse_integer(value_str: str) -> int | None:
-        if not value_str:
-            return None
-        try:
-            return int(value_str)
-        except (ValueError, TypeError):
-            return None
-
-    amount_covered = parse_decimal(amount_covered_str)
-    amount_uncovered = parse_decimal(amount_uncovered_str)
-    revenue = parse_decimal(revenue_str)
-    covered_encounters = parse_integer(covered_encounters_str)
-    uncovered_encounters = parse_integer(uncovered_encounters_str)
-    covered_medications = parse_integer(covered_medications_str)
-    uncovered_medications = parse_integer(uncovered_medications_str)
-    covered_procedures = parse_integer(covered_procedures_str)
-    uncovered_procedures = parse_integer(uncovered_procedures_str)
-    covered_immunizations = parse_integer(covered_immunizations_str)
-    uncovered_immunizations = parse_integer(uncovered_immunizations_str)
-    unique_customers = parse_integer(unique_customers_str)
-    qols_avg = parse_decimal(qols_avg_str)
-    member_months = parse_integer(member_months_str)
-
-    # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "Organization",
-        "id": payer_id if payer_id else "",
-    }
-
-    # Set name (required)
     if name:
         resource["name"] = name
 
-    # Set type (Insurance Company)
+    # Set type as insurance company
     resource["type"] = [
         {
             "coding": [
@@ -162,7 +69,6 @@ def map_payer(csv_row: dict[str, Any]) -> dict[str, Any]:
     # Set address
     if address or city or state or zip_code:
         address_obj: dict[str, Any] = {}
-
         if address:
             address_obj["line"] = [address]
         if city:
@@ -171,27 +77,15 @@ def map_payer(csv_row: dict[str, Any]) -> dict[str, Any]:
             address_obj["state"] = state
         if zip_code:
             address_obj["postalCode"] = zip_code
-
         resource["address"] = [address_obj]
 
-    # Set telecom (phone numbers)
+    # Set telecom
     phones = split_phones(phone_str)
     if phones:
         resource["telecom"] = [{"system": "phone", "value": phone} for phone in phones]
 
-    # Set extensions (ownership and payer stats)
+    # Build stats extension
     extensions = []
-
-    # Ownership extension
-    if ownership:
-        extensions.append(
-            {
-                "url": "http://synthea.mitre.org/fhir/StructureDefinition/payer-ownership",
-                "valueCode": ownership.lower().strip(),
-            }
-        )
-
-    # Payer stats extension with nested sub-extensions
     stats_fields = [
         ("amountCovered", amount_covered, "valueDecimal"),
         ("amountUncovered", amount_uncovered, "valueDecimal"),
@@ -209,7 +103,7 @@ def map_payer(csv_row: dict[str, Any]) -> dict[str, Any]:
         ("memberMonths", member_months, "valueInteger"),
     ]
 
-    stats_extension: dict[str, Any] = {
+    stats_ext: dict[str, Any] = {
         "url": "http://synthea.mitre.org/fhir/StructureDefinition/payer-stats",
         "extension": [],
     }
@@ -218,15 +112,15 @@ def map_payer(csv_row: dict[str, Any]) -> dict[str, Any]:
         if value is not None:
             sub_ext: dict[str, Any] = {"url": field_name}
             if value_type == "valueDecimal":
-                sub_ext["valueDecimal"] = value
+                sub_ext["valueDecimal"] = float(value)
             elif value_type == "valueInteger":
-                sub_ext["valueInteger"] = value
-            stats_extension["extension"].append(sub_ext)
+                sub_ext["valueInteger"] = int(value)
+            stats_ext["extension"].append(sub_ext)
 
-    if stats_extension["extension"]:
-        extensions.append(stats_extension)
+    if stats_ext["extension"]:
+        extensions.append(stats_ext)
 
     if extensions:
         resource["extension"] = extensions
 
-    return resource
+    return Organization(**resource)

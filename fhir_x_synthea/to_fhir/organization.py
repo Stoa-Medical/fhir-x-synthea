@@ -1,82 +1,45 @@
-"""
-Mapping function for converting Synthea organizations.csv rows to FHIR Organization resources.
-"""
+"""Synthea Organization → FHIR R4 Organization"""
 
-import re
 from typing import Any
 
+from fhir.resources.organization import Organization
+from synthea_pydantic import Organization as SyntheaOrganization
 
-def map_organization(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea organizations.csv row to a FHIR R4 Organization resource.
+from ..utils import split_phones, to_str
+
+
+def convert(src: SyntheaOrganization) -> Organization:
+    """Convert Synthea Organization to FHIR R4 Organization.
 
     Args:
-        csv_row: Dictionary with keys like Id, Name, Address, City, State, Zip,
-                Lat, Lon, Phone, Revenue, Utilization
+        src: Synthea Organization model
 
     Returns:
-        Dictionary representing a FHIR Organization resource
+        FHIR R4 Organization resource
     """
+    d = src.model_dump()
 
-    # Helper to split phone numbers
-    def split_phones(phone_str: str | None) -> list[str]:
-        if not phone_str or phone_str.strip() == "":
-            return []
-        # Split on common delimiters: comma, semicolon, slash, pipe
-        phones = re.split(r"[,;/|]", phone_str)
-        # Trim whitespace and filter empty strings
-        return [p.strip() for p in phones if p.strip()]
+    # Extract fields
+    org_id = to_str(d.get("id"))
+    name = to_str(d.get("name"))
+    address = to_str(d.get("address"))
+    city = to_str(d.get("city"))
+    state = to_str(d.get("state"))
+    zip_code = to_str(d.get("zip"))
+    phone_str = to_str(d.get("phone"))
 
-    # Extract and process fields
-    org_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    name = csv_row.get("Name", "").strip() if csv_row.get("Name") else ""
-    address = csv_row.get("Address", "").strip() if csv_row.get("Address") else ""
-    city = csv_row.get("City", "").strip() if csv_row.get("City") else ""
-    state = csv_row.get("State", "").strip() if csv_row.get("State") else ""
-    zip_code = csv_row.get("Zip", "").strip() if csv_row.get("Zip") else ""
-    lat_str = csv_row.get("Lat", "").strip() if csv_row.get("Lat") else ""
-    lon_str = csv_row.get("Lon", "").strip() if csv_row.get("Lon") else ""
-    phone_str = csv_row.get("Phone", "").strip() if csv_row.get("Phone") else ""
-    revenue_str = csv_row.get("Revenue", "").strip() if csv_row.get("Revenue") else ""
-    utilization_str = (
-        csv_row.get("Utilization", "").strip() if csv_row.get("Utilization") else ""
-    )
+    # Handle numeric fields
+    lat = d.get("lat")
+    lon = d.get("lon")
+    revenue = d.get("revenue")
+    utilization = d.get("utilization")
 
-    # Parse numeric fields
-    lat = None
-    lon = None
-    if lat_str:
-        try:
-            lat = float(lat_str)
-        except (ValueError, TypeError):
-            pass
-    if lon_str:
-        try:
-            lon = float(lon_str)
-        except (ValueError, TypeError):
-            pass
+    # Build resource
+    resource: dict[str, Any] = {"resourceType": "Organization"}
 
-    revenue = None
-    if revenue_str:
-        try:
-            revenue = float(revenue_str)
-        except (ValueError, TypeError):
-            pass
+    if org_id:
+        resource["id"] = org_id
 
-    utilization = None
-    if utilization_str:
-        try:
-            utilization = int(utilization_str)
-        except (ValueError, TypeError):
-            pass
-
-    # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "Organization",
-        "id": org_id if org_id else "",
-    }
-
-    # Set name (required)
     if name:
         resource["name"] = name
 
@@ -93,48 +56,43 @@ def map_organization(csv_row: dict[str, Any]) -> dict[str, Any]:
         if zip_code:
             address_obj["postalCode"] = zip_code
 
-        # Geolocation extension
         if lat is not None and lon is not None:
             address_obj.setdefault("extension", []).append(
                 {
                     "url": "http://hl7.org/fhir/StructureDefinition/geolocation",
                     "extension": [
-                        {"url": "latitude", "valueDecimal": lat},
-                        {"url": "longitude", "valueDecimal": lon},
+                        {"url": "latitude", "valueDecimal": float(lat)},
+                        {"url": "longitude", "valueDecimal": float(lon)},
                     ],
                 }
             )
 
         resource["address"] = [address_obj]
 
-    # Set telecom (phone numbers)
+    # Set telecom
     phones = split_phones(phone_str)
     if phones:
         resource["telecom"] = [{"system": "phone", "value": phone} for phone in phones]
 
-    # Set extensions (organization stats)
+    # Set extensions for stats
     extensions = []
-
     if revenue is not None or utilization is not None:
-        stats_extension: dict[str, Any] = {
+        stats_ext: dict[str, Any] = {
             "url": "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
             "extension": [],
         }
-
         if revenue is not None:
-            stats_extension["extension"].append(
-                {"url": "revenue", "valueDecimal": revenue}
+            stats_ext["extension"].append(
+                {"url": "revenue", "valueDecimal": float(revenue)}
             )
-
         if utilization is not None:
-            stats_extension["extension"].append(
-                {"url": "utilization", "valueInteger": utilization}
+            stats_ext["extension"].append(
+                {"url": "utilization", "valueInteger": int(utilization)}
             )
-
-        if stats_extension["extension"]:
-            extensions.append(stats_extension)
+        if stats_ext["extension"]:
+            extensions.append(stats_ext)
 
     if extensions:
         resource["extension"] = extensions
 
-    return resource
+    return Organization(**resource)

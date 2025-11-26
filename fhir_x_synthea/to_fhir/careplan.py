@@ -1,61 +1,60 @@
-"""
-Mapping function for converting Synthea careplans.csv rows to FHIR CarePlan resources.
-"""
+"""Synthea CarePlan → FHIR R4 CarePlan"""
 
 from typing import Any
 
-from ..fhir_lib import create_reference, format_datetime
+from fhir.resources.careplan import CarePlan
+from synthea_pydantic import CarePlan as SyntheaCarePlan
+
+from ..fhir_lib import format_datetime
+from ..utils import to_str
 
 
-def map_careplan(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea careplans.csv row to a FHIR R4 CarePlan resource.
+def convert(
+    src: SyntheaCarePlan,
+    *,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+) -> CarePlan:
+    """Convert Synthea CarePlan to FHIR R4 CarePlan.
 
     Args:
-        csv_row: Dictionary with keys like Id, Start, Stop, Patient, Encounter,
-                Code, Description, ReasonCode, ReasonDescription
+        src: Synthea CarePlan model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
+        encounter_ref: Optional encounter reference (e.g., "Encounter/456")
 
     Returns:
-        Dictionary representing a FHIR CarePlan resource
+        FHIR R4 CarePlan resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    careplan_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    start = csv_row.get("Start", "").strip() if csv_row.get("Start") else ""
-    stop = csv_row.get("Stop", "").strip() if csv_row.get("Stop") else ""
-    patient_id = csv_row.get("Patient", "").strip() if csv_row.get("Patient") else ""
-    encounter_id = (
-        csv_row.get("Encounter", "").strip() if csv_row.get("Encounter") else ""
-    )
-    code = csv_row.get("Code", "").strip() if csv_row.get("Code") else ""
-    description = (
-        csv_row.get("Description", "").strip() if csv_row.get("Description") else ""
-    )
-    reason_code = (
-        csv_row.get("ReasonCode", "").strip() if csv_row.get("ReasonCode") else ""
-    )
-    reason_description = (
-        csv_row.get("ReasonDescription", "").strip()
-        if csv_row.get("ReasonDescription")
-        else ""
-    )
+    # Extract fields
+    careplan_id = to_str(d.get("id"))
+    start = to_str(d.get("start"))
+    stop = to_str(d.get("stop"))
+    patient_id = to_str(d.get("patient"))
+    encounter_id = to_str(d.get("encounter"))
+    code = to_str(d.get("code"))
+    description = to_str(d.get("description"))
+    reason_code = to_str(d.get("reasoncode"))
+    reason_description = to_str(d.get("reasondescription"))
 
-    # Determine status based on STOP field
-    status = "active" if (not stop or stop == "") else "completed"
+    # Determine status
+    status = "active" if not stop else "completed"
 
-    # Generate resource ID (use Id if present, otherwise generate from Patient+Start+Code)
-    if careplan_id:
-        resource_id = careplan_id
-    else:
-        resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
+    # Generate resource ID
+    resource_id = careplan_id or f"{patient_id}-{start}-{code}".replace(
+        " ", "-"
+    ).replace(":", "-")
 
-    # Build base resource
+    # Build resource
     resource: dict[str, Any] = {
         "resourceType": "CarePlan",
-        "id": resource_id,
         "status": status,
         "intent": "plan",
     }
+
+    if resource_id:
+        resource["id"] = resource_id
 
     # Set period
     period: dict[str, Any] = {}
@@ -70,19 +69,21 @@ def map_careplan(csv_row: dict[str, Any]) -> dict[str, Any]:
     if period:
         resource["period"] = period
 
-    # Set subject (patient) reference (required)
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["subject"] = patient_ref
+    # Set subject reference
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    if effective_patient_ref:
+        resource["subject"] = {"reference": effective_patient_ref}
 
-    # Set encounter reference (optional)
-    if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource["encounter"] = encounter_ref
+    # Set encounter reference
+    effective_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+    if effective_encounter_ref:
+        resource["encounter"] = {"reference": effective_encounter_ref}
 
-    # Set category (SNOMED CT)
+    # Set category
     if code:
         resource["category"] = [
             {"coding": [{"system": "http://snomed.info/sct", "code": code}]}
@@ -93,17 +94,16 @@ def map_careplan(csv_row: dict[str, Any]) -> dict[str, Any]:
         resource["description"] = description
         resource["title"] = description
 
-    # Set reasonCode (SNOMED CT)
+    # Set addresses (reason) - R4B uses addresses instead of reasonCode
     if reason_code or reason_description:
-        reason_code_obj: dict[str, Any] = {}
+        addresses_obj: dict[str, Any] = {}
         if reason_code:
             coding = {"system": "http://snomed.info/sct", "code": reason_code}
             if reason_description:
                 coding["display"] = reason_description
-            reason_code_obj["coding"] = [coding]
-        if reason_description and not reason_code:
-            reason_code_obj["text"] = reason_description
-        if reason_code_obj:
-            resource["reasonCode"] = [reason_code_obj]
+            addresses_obj["coding"] = [coding]
+        if reason_description:
+            addresses_obj["text"] = reason_description
+        resource["addresses"] = [{"concept": addresses_obj}]
 
-    return resource
+    return CarePlan(**resource)

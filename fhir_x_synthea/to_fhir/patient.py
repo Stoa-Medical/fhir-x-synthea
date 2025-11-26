@@ -1,8 +1,9 @@
-"""
-Mapping function for converting Synthea patients.csv rows to FHIR Patient resources.
-"""
+"""Synthea Patient → FHIR R4 Patient"""
 
 from typing import Any
+
+from fhir.resources.patient import Patient
+from synthea_pydantic import Patient as SyntheaPatient
 
 from ..fhir_lib import (
     format_date,
@@ -10,70 +11,54 @@ from ..fhir_lib import (
     map_gender,
     map_marital_status,
 )
+from ..utils import to_str
 
 
-def map_patient(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea patients.csv row to a FHIR R4 Patient resource.
+def convert(src: SyntheaPatient) -> Patient:
+    """Convert Synthea Patient to FHIR R4 Patient.
 
     Args:
-        csv_row: Dictionary with keys like Id, BIRTHDATE, DEATHDATE, SSN, DRIVERS,
-                PASSPORT, PREFIX, FIRST, LAST, SUFFIX, MAIDEN, MARITAL, RACE,
-                ETHNICITY, GENDER, BIRTHPLACE, ADDRESS, CITY, STATE, COUNTY, ZIP, LAT, LON
+        src: Synthea Patient model
 
     Returns:
-        Dictionary representing a FHIR Patient resource
+        FHIR R4 Patient resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    patient_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    birthdate = csv_row.get("BIRTHDATE", "").strip() if csv_row.get("BIRTHDATE") else ""
-    deathdate = csv_row.get("DEATHDATE", "").strip() if csv_row.get("DEATHDATE") else ""
-    ssn = csv_row.get("SSN", "").strip() if csv_row.get("SSN") else ""
-    drivers = csv_row.get("DRIVERS", "").strip() if csv_row.get("DRIVERS") else ""
-    passport = csv_row.get("PASSPORT", "").strip() if csv_row.get("PASSPORT") else ""
-    prefix = csv_row.get("PREFIX", "").strip() if csv_row.get("PREFIX") else ""
-    first = csv_row.get("FIRST", "").strip() if csv_row.get("FIRST") else ""
-    last = csv_row.get("LAST", "").strip() if csv_row.get("LAST") else ""
-    suffix = csv_row.get("SUFFIX", "").strip() if csv_row.get("SUFFIX") else ""
-    maiden = csv_row.get("MAIDEN", "").strip() if csv_row.get("MAIDEN") else ""
-    marital = csv_row.get("MARITAL", "").strip() if csv_row.get("MARITAL") else ""
-    race = csv_row.get("RACE", "").strip() if csv_row.get("RACE") else ""
-    ethnicity = csv_row.get("ETHNICITY", "").strip() if csv_row.get("ETHNICITY") else ""
-    gender = csv_row.get("GENDER", "").strip() if csv_row.get("GENDER") else ""
-    birthplace = (
-        csv_row.get("BIRTHPLACE", "").strip() if csv_row.get("BIRTHPLACE") else ""
-    )
-    address = csv_row.get("ADDRESS", "").strip() if csv_row.get("ADDRESS") else ""
-    city = csv_row.get("CITY", "").strip() if csv_row.get("CITY") else ""
-    state = csv_row.get("STATE", "").strip() if csv_row.get("STATE") else ""
-    county = csv_row.get("COUNTY", "").strip() if csv_row.get("COUNTY") else ""
-    zip_code = csv_row.get("ZIP", "").strip() if csv_row.get("ZIP") else ""
-    lat_str = csv_row.get("LAT", "").strip() if csv_row.get("LAT") else ""
-    lon_str = csv_row.get("LON", "").strip() if csv_row.get("LON") else ""
-
-    # Parse coordinates
-    lat = None
-    lon = None
-    if lat_str:
-        try:
-            lat = float(lat_str)
-        except (ValueError, TypeError):
-            pass
-    if lon_str:
-        try:
-            lon = float(lon_str)
-        except (ValueError, TypeError):
-            pass
+    # Extract and process fields (synthea_pydantic uses lowercase keys)
+    patient_id = to_str(d.get("id"))
+    birthdate = to_str(d.get("birthdate"))
+    deathdate = to_str(d.get("deathdate"))
+    ssn = to_str(d.get("ssn"))
+    drivers = to_str(d.get("drivers"))
+    passport = to_str(d.get("passport"))
+    prefix = to_str(d.get("prefix"))
+    first = to_str(d.get("first"))
+    last = to_str(d.get("last"))
+    suffix = to_str(d.get("suffix"))
+    maiden = to_str(d.get("maiden"))
+    marital = to_str(d.get("marital"))
+    race = to_str(d.get("race"))
+    ethnicity = to_str(d.get("ethnicity"))
+    gender = to_str(d.get("gender"))
+    birthplace = to_str(d.get("birthplace"))
+    address = to_str(d.get("address"))
+    city = to_str(d.get("city"))
+    state = to_str(d.get("state"))
+    county = to_str(d.get("county"))
+    zip_code = to_str(d.get("zip"))
+    lat = d.get("lat")
+    lon = d.get("lon")
 
     # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "Patient",
-        "id": patient_id if patient_id else "",
-    }
+    resource: dict[str, Any] = {"resourceType": "Patient"}
+
+    # Only set id if present
+    if patient_id:
+        resource["id"] = patient_id
 
     # Set identifiers
-    identifiers = []
+    identifiers: list[dict[str, Any]] = []
 
     # Medical Record Number (Id)
     if patient_id:
@@ -244,12 +229,12 @@ def map_patient(csv_row: dict[str, Any]) -> dict[str, Any]:
                 {
                     "url": "http://hl7.org/fhir/StructureDefinition/geolocation",
                     "extension": [
-                        {"url": "latitude", "valueDecimal": lat},
-                        {"url": "longitude", "valueDecimal": lon},
+                        {"url": "latitude", "valueDecimal": float(lat)},
+                        {"url": "longitude", "valueDecimal": float(lon)},
                     ],
                 }
             )
 
         resource["address"] = [address_obj]
 
-    return resource
+    return Patient(**resource)

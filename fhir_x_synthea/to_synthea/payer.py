@@ -1,89 +1,66 @@
-"""
-Mapping function for converting FHIR Organization resources (payers) to Synthea payers.csv rows.
-"""
+"""FHIR R4 Organization (Payer) → Synthea Payer"""
 
+import logging
+from decimal import Decimal
 from typing import Any
+
+from fhir.resources.organization import Organization
+from synthea_pydantic import Payer as SyntheaPayer
 
 from ..synthea_csv_lib import extract_nested_extension
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_payer_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a FHIR R4 Organization resource representing a payer to a Synthea payers.csv row.
+
+def _extract_extension_code(fhir_resource: dict[str, Any], extension_url: str) -> str:
+    """Extract code value from extension."""
+    extensions = fhir_resource.get("extension", [])
+    for ext in extensions:
+        if ext.get("url") == extension_url:
+            value = ext.get("valueCode")
+            if value:
+                return value
+    return ""
+
+
+def convert(src: Organization) -> SyntheaPayer:
+    """Convert FHIR R4 Organization (payer type) to Synthea Payer.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR Organization resource
+        src: FHIR R4 Organization resource
 
     Returns:
-        Dictionary with CSV column names as keys
+        Synthea Payer model
+
+    Note:
+        Some FHIR fields may not be representable in Synthea format.
+        Check logs for warnings about dropped data.
     """
-
-    # Helper to extract extension value
-    def extract_extension_code(
-        fhir_resource: dict[str, Any], extension_url: str
-    ) -> str:
-        extensions = fhir_resource.get("extension", [])
-        for ext in extensions:
-            if ext.get("url") == extension_url:
-                value = ext.get("valueCode")
-                if value:
-                    return value
-        return ""
-
-    # Initialize CSV row
-    csv_row: dict[str, str] = {
-        "Id": "",
-        "Name": "",
-        "Ownership": "",
-        "Address": "",
-        "City": "",
-        "State_Headquartered": "",
-        "Zip": "",
-        "Phone": "",
-        "Amount_Covered": "",
-        "Amount_Uncovered": "",
-        "Revenue": "",
-        "Covered_Encounters": "",
-        "Uncovered_Encounters": "",
-        "Covered_Medications": "",
-        "Uncovered_Medications": "",
-        "Covered_Procedures": "",
-        "Uncovered_Procedures": "",
-        "Covered_Immunizations": "",
-        "Uncovered_Immunizations": "",
-        "Unique_Customers": "",
-        "QOLS_Avg": "",
-        "Member_Months": "",
-    }
+    fhir_resource = src.model_dump(exclude_none=True)
 
     # Extract Id
     resource_id = fhir_resource.get("id", "")
-    if resource_id:
-        csv_row["Id"] = resource_id
 
     # Extract Name
     name = fhir_resource.get("name", "")
-    if name:
-        csv_row["Name"] = name
-
-    # Extract Ownership from extension
-    csv_row["Ownership"] = extract_extension_code(
-        fhir_resource,
-        "http://synthea.mitre.org/fhir/StructureDefinition/payer-ownership",
-    )
 
     # Extract Address components
+    address = ""
+    city = ""
+    state_headquartered = ""
+    zip_code = ""
+
     addresses = fhir_resource.get("address", [])
     if addresses:
         first_address = addresses[0]
 
         lines = first_address.get("line", [])
         if lines:
-            csv_row["Address"] = lines[0]
+            address = lines[0]
 
-        csv_row["City"] = first_address.get("city", "")
-        csv_row["State_Headquartered"] = first_address.get("state", "")
-        csv_row["Zip"] = first_address.get("postalCode", "")
+        city = first_address.get("city", "")
+        state_headquartered = first_address.get("state", "")
+        zip_code = first_address.get("postalCode", "")
 
     # Extract Phone numbers (join with ; )
     telecom = fhir_resource.get("telecom", [])
@@ -94,55 +71,94 @@ def map_fhir_payer_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
             if value:
                 phones.append(value)
 
-    if phones:
-        csv_row["Phone"] = "; ".join(phones)
+    phone = "; ".join(phones) if phones else ""
 
     # Extract payer-stats extension nested values
     stats_extension_url = (
         "http://synthea.mitre.org/fhir/StructureDefinition/payer-stats"
     )
 
-    csv_row["Amount_Covered"] = extract_nested_extension(
+    amount_covered_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "amountCovered", "valueDecimal"
     )
-    csv_row["Amount_Uncovered"] = extract_nested_extension(
+    amount_uncovered_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "amountUncovered", "valueDecimal"
     )
-    csv_row["Revenue"] = extract_nested_extension(
+    revenue_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "revenue", "valueDecimal"
     )
-    csv_row["Covered_Encounters"] = extract_nested_extension(
+    covered_encounters_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "coveredEncounters", "valueInteger"
     )
-    csv_row["Uncovered_Encounters"] = extract_nested_extension(
+    uncovered_encounters_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "uncoveredEncounters", "valueInteger"
     )
-    csv_row["Covered_Medications"] = extract_nested_extension(
+    covered_medications_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "coveredMedications", "valueInteger"
     )
-    csv_row["Uncovered_Medications"] = extract_nested_extension(
+    uncovered_medications_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "uncoveredMedications", "valueInteger"
     )
-    csv_row["Covered_Procedures"] = extract_nested_extension(
+    covered_procedures_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "coveredProcedures", "valueInteger"
     )
-    csv_row["Uncovered_Procedures"] = extract_nested_extension(
+    uncovered_procedures_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "uncoveredProcedures", "valueInteger"
     )
-    csv_row["Covered_Immunizations"] = extract_nested_extension(
+    covered_immunizations_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "coveredImmunizations", "valueInteger"
     )
-    csv_row["Uncovered_Immunizations"] = extract_nested_extension(
+    uncovered_immunizations_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "uncoveredImmunizations", "valueInteger"
     )
-    csv_row["Unique_Customers"] = extract_nested_extension(
+    unique_customers_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "uniqueCustomers", "valueInteger"
     )
-    csv_row["QOLS_Avg"] = extract_nested_extension(
+    qols_avg_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "qolsAvg", "valueDecimal"
     )
-    csv_row["Member_Months"] = extract_nested_extension(
+    member_months_str = extract_nested_extension(
         fhir_resource, stats_extension_url, "memberMonths", "valueInteger"
     )
 
-    return csv_row
+    return SyntheaPayer(
+        id=resource_id or None,
+        name=name or "Unknown Payer",
+        address=address or None,
+        city=city or None,
+        state_headquartered=state_headquartered or None,
+        zip=zip_code or None,
+        phone=phone or None,
+        amount_covered=Decimal(amount_covered_str) if amount_covered_str else None,
+        amount_uncovered=Decimal(amount_uncovered_str)
+        if amount_uncovered_str
+        else None,
+        revenue=Decimal(revenue_str) if revenue_str else None,
+        covered_encounters=int(covered_encounters_str)
+        if covered_encounters_str
+        else None,
+        uncovered_encounters=int(uncovered_encounters_str)
+        if uncovered_encounters_str
+        else None,
+        covered_medications=int(covered_medications_str)
+        if covered_medications_str
+        else None,
+        uncovered_medications=int(uncovered_medications_str)
+        if uncovered_medications_str
+        else None,
+        covered_procedures=int(covered_procedures_str)
+        if covered_procedures_str
+        else None,
+        uncovered_procedures=int(uncovered_procedures_str)
+        if uncovered_procedures_str
+        else None,
+        covered_immunizations=int(covered_immunizations_str)
+        if covered_immunizations_str
+        else None,
+        uncovered_immunizations=int(uncovered_immunizations_str)
+        if uncovered_immunizations_str
+        else None,
+        unique_customers=int(unique_customers_str) if unique_customers_str else None,
+        qols_avg=Decimal(qols_avg_str) if qols_avg_str else None,
+        member_months=int(member_months_str) if member_months_str else None,
+    )

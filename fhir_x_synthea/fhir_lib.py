@@ -9,18 +9,30 @@ from typing import Any
 
 def format_datetime(date_str: str | None) -> str | None:
     """
-    Format a Synthea datetime string to ISO 8601 format.
+    Format a Synthea datetime string to ISO 8601 format with timezone.
 
     Args:
-        date_str: Datetime string in Synthea format (e.g., "2020-01-15T10:30:00Z")
+        date_str: Datetime string in Synthea format (e.g., "2020-01-15T10:30:00Z" or "2020-01-15")
 
     Returns:
-        ISO 8601 formatted datetime string, or None if parsing fails
+        ISO 8601 formatted datetime string with timezone, or None if parsing fails
     """
     if not date_str or date_str.strip() == "":
         return None
     try:
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        from datetime import timezone
+
+        date_str = date_str.strip()
+        # Handle Z suffix
+        date_str = date_str.replace("Z", "+00:00")
+
+        # Parse the datetime
+        dt = datetime.fromisoformat(date_str)
+
+        # Ensure timezone is present (assume UTC if missing)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
         return dt.isoformat()
     except (ValueError, AttributeError):
         return None

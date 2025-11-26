@@ -1,46 +1,50 @@
-"""
-Mapping function for converting Synthea conditions.csv rows to FHIR Condition resources.
-"""
+"""Synthea Condition → FHIR R4 Condition"""
 
 from typing import Any
 
+from fhir.resources.condition import Condition
+from synthea_pydantic import Condition as SyntheaCondition
+
 from ..fhir_lib import (
     create_clinical_status_coding,
-    create_reference,
     format_datetime,
 )
+from ..utils import to_str
 
 
-def map_condition(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea conditions.csv row to a FHIR R4 Condition resource.
+def convert(
+    src: SyntheaCondition,
+    *,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+) -> Condition:
+    """Convert Synthea Condition to FHIR R4 Condition.
 
     Args:
-        csv_row: Dictionary with keys like START, STOP, PATIENT, ENCOUNTER, CODE, DESCRIPTION
+        src: Synthea Condition model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
+        encounter_ref: Optional encounter reference (e.g., "Encounter/456")
 
     Returns:
-        Dictionary representing a FHIR Condition resource
+        FHIR R4 Condition resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    start = csv_row.get("START", "").strip() if csv_row.get("START") else ""
-    stop = csv_row.get("STOP", "").strip() if csv_row.get("STOP") else ""
-    patient_id = csv_row.get("PATIENT", "").strip() if csv_row.get("PATIENT") else ""
-    encounter_id = (
-        csv_row.get("ENCOUNTER", "").strip() if csv_row.get("ENCOUNTER") else ""
-    )
-    code = csv_row.get("CODE", "").strip() if csv_row.get("CODE") else ""
-    description = (
-        csv_row.get("DESCRIPTION", "").strip() if csv_row.get("DESCRIPTION") else ""
-    )
+    # Extract and process fields (synthea_pydantic uses lowercase keys)
+    start = to_str(d.get("start"))
+    stop = to_str(d.get("stop"))
+    patient_id = to_str(d.get("patient"))
+    encounter_id = to_str(d.get("encounter"))
+    code = to_str(d.get("code"))
+    description = to_str(d.get("description"))
 
-    # Determine clinical status based on STOP field
-    is_active = not stop or stop == ""
+    # Determine clinical status based on stop field
+    is_active = not stop
     clinical_status = create_clinical_status_coding(
         is_active, "http://terminology.hl7.org/CodeSystem/condition-clinical"
     )
 
-    # Generate resource ID from PATIENT+START+CODE
+    # Generate resource ID from patient+start+code
     resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
 
     # Build base resource
@@ -70,29 +74,31 @@ def map_condition(csv_row: dict[str, Any]) -> dict[str, Any]:
         ],
     }
 
-    # Set onsetDateTime from START
+    # Set onsetDateTime from start
     if start:
         iso_start = format_datetime(start)
         if iso_start:
             resource["onsetDateTime"] = iso_start
 
-    # Set abatementDateTime from STOP if present
+    # Set abatementDateTime from stop if present
     if stop:
         iso_stop = format_datetime(stop)
         if iso_stop:
             resource["abatementDateTime"] = iso_stop
 
-    # Set subject (patient) reference (required)
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["subject"] = patient_ref
+    # Set subject (patient) reference - use override or from source
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    if effective_patient_ref:
+        resource["subject"] = {"reference": effective_patient_ref}
 
-    # Set encounter reference (optional)
-    if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource["encounter"] = encounter_ref
+    # Set encounter reference - use override or from source
+    effective_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+    if effective_encounter_ref:
+        resource["encounter"] = {"reference": effective_encounter_ref}
 
     # Set code (SNOMED CT)
     if code or description:
@@ -107,4 +113,4 @@ def map_condition(csv_row: dict[str, Any]) -> dict[str, Any]:
         if code_obj:
             resource["code"] = code_obj
 
-    return resource
+    return Condition(**resource)

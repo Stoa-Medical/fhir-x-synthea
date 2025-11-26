@@ -1,57 +1,44 @@
-"""
-Mapping function for converting Synthea procedures.csv rows to FHIR Procedure resources.
-"""
+"""Synthea Procedure → FHIR R4 Procedure"""
 
 from typing import Any
 
-from ..fhir_lib import create_reference, format_datetime
+from fhir.resources.procedure import Procedure
+from synthea_pydantic import Procedure as SyntheaProcedure
+
+from ..fhir_lib import format_datetime
+from ..utils import to_str
 
 
-def map_procedure(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea procedures.csv row to a FHIR R4 Procedure resource.
+def convert(
+    src: SyntheaProcedure,
+    *,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+) -> Procedure:
+    """Convert Synthea Procedure to FHIR R4 Procedure.
 
     Args:
-        csv_row: Dictionary with keys like START, STOP, PATIENT, ENCOUNTER,
-                SYSTEM, CODE, DESCRIPTION, BASE_COST, REASONCODE, REASONDESCRIPTION
+        src: Synthea Procedure model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
+        encounter_ref: Optional encounter reference (e.g., "Encounter/456")
 
     Returns:
-        Dictionary representing a FHIR Procedure resource
+        FHIR R4 Procedure resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    start = csv_row.get("START", "").strip() if csv_row.get("START") else ""
-    stop = csv_row.get("STOP", "").strip() if csv_row.get("STOP") else ""
-    patient_id = csv_row.get("PATIENT", "").strip() if csv_row.get("PATIENT") else ""
-    encounter_id = (
-        csv_row.get("ENCOUNTER", "").strip() if csv_row.get("ENCOUNTER") else ""
-    )
-    system = csv_row.get("SYSTEM", "").strip() if csv_row.get("SYSTEM") else ""
-    code = csv_row.get("CODE", "").strip() if csv_row.get("CODE") else ""
-    description = (
-        csv_row.get("DESCRIPTION", "").strip() if csv_row.get("DESCRIPTION") else ""
-    )
-    base_cost_str = (
-        csv_row.get("BASE_COST", "").strip() if csv_row.get("BASE_COST") else ""
-    )
-    reason_code = (
-        csv_row.get("REASONCODE", "").strip() if csv_row.get("REASONCODE") else ""
-    )
-    reason_description = (
-        csv_row.get("REASONDESCRIPTION", "").strip()
-        if csv_row.get("REASONDESCRIPTION")
-        else ""
-    )
+    # Extract fields
+    start = to_str(d.get("start"))
+    stop = to_str(d.get("stop"))
+    patient_id = to_str(d.get("patient"))
+    encounter_id = to_str(d.get("encounter"))
+    code = to_str(d.get("code"))
+    description = to_str(d.get("description"))
+    base_cost = d.get("base_cost")
+    reason_code = to_str(d.get("reasoncode"))
+    reason_description = to_str(d.get("reasondescription"))
 
-    # Parse base cost
-    base_cost = None
-    if base_cost_str:
-        try:
-            base_cost = float(base_cost_str)
-        except (ValueError, TypeError):
-            pass
-
-    # Generate resource ID from PATIENT+START+CODE
+    # Generate resource ID
     resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
 
     # Build base resource
@@ -61,71 +48,70 @@ def map_procedure(csv_row: dict[str, Any]) -> dict[str, Any]:
         "status": "completed",
     }
 
-    # Set performedDateTime or performedPeriod based on presence of STOP
+    # Set performed period or datetime
     if start:
         iso_start = format_datetime(start)
         if iso_start:
             if stop:
-                # Use performedPeriod if STOP is present
                 iso_stop = format_datetime(stop)
                 if iso_stop:
-                    resource["performedPeriod"] = {"start": iso_start, "end": iso_stop}
+                    resource["occurrencePeriod"] = {"start": iso_start, "end": iso_stop}
                 else:
-                    resource["performedDateTime"] = iso_start
+                    resource["occurrenceDateTime"] = iso_start
             else:
-                # Use performedDateTime if only START is present
-                resource["performedDateTime"] = iso_start
+                resource["occurrenceDateTime"] = iso_start
 
-    # Set subject (patient) reference
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["subject"] = patient_ref
+    # Set subject reference
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    if effective_patient_ref:
+        resource["subject"] = {"reference": effective_patient_ref}
 
     # Set encounter reference
-    if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource["encounter"] = encounter_ref
+    effective_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+    if effective_encounter_ref:
+        resource["encounter"] = {"reference": effective_encounter_ref}
 
     # Set code
-    if code or system or description:
+    if code or description:
         code_obj: dict[str, Any] = {}
-        if code or system:
-            coding = {}
-            if system:
-                coding["system"] = system
-            if code:
-                coding["code"] = code
-            if description:
-                coding["display"] = description
-            if coding:
-                code_obj["coding"] = [coding]
+        if code:
+            code_obj["coding"] = [
+                {
+                    "system": "http://snomed.info/sct",
+                    "code": code,
+                    "display": description or None,
+                }
+            ]
         if description:
             code_obj["text"] = description
-        if code_obj:
-            resource["code"] = code_obj
+        resource["code"] = code_obj
 
-    # Set reasonCode
+    # Set reason (R4B uses reason with CodeableReference)
     if reason_code or reason_description:
-        reason_code_obj: dict[str, Any] = {}
+        concept: dict[str, Any] = {}
         if reason_code:
-            coding = {"system": "http://snomed.info/sct", "code": reason_code}
-            if reason_description:
-                coding["display"] = reason_description
-            reason_code_obj["coding"] = [coding]
-        if reason_description and not reason_code:
-            reason_code_obj["text"] = reason_description
-        if reason_code_obj:
-            resource["reasonCode"] = [reason_code_obj]
+            concept["coding"] = [
+                {
+                    "system": "http://snomed.info/sct",
+                    "code": reason_code,
+                    "display": reason_description or None,
+                }
+            ]
+        if reason_description:
+            concept["text"] = reason_description
+        resource["reason"] = [{"concept": concept}]
 
-    # Set base cost extension
+    # Set cost extension
     if base_cost is not None:
-        resource.setdefault("extension", []).append(
+        resource["extension"] = [
             {
                 "url": "http://example.org/fhir/StructureDefinition/baseCost",
-                "valueMoney": {"value": base_cost, "currency": "USD"},
+                "valueMoney": {"value": float(base_cost), "currency": "USD"},
             }
-        )
+        ]
 
-    return resource
+    return Procedure(**resource)

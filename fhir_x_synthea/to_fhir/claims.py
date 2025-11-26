@@ -1,88 +1,44 @@
-"""
-Mapping function for converting Synthea claims.csv rows to FHIR Claim resources.
-"""
+"""Synthea Claim → FHIR R4 Claim"""
 
 from typing import Any
 
+from fhir.resources.claim import Claim
+from synthea_pydantic import Claim as SyntheaClaim
+
 from ..fhir_lib import create_reference, format_datetime
+from ..utils import to_str
 
 
-def map_claim(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea claims.csv row to a FHIR R4 Claim resource.
+def convert(src: SyntheaClaim) -> Claim:
+    """Convert Synthea Claim to FHIR R4 Claim.
 
     Args:
-        csv_row: Dictionary with keys like Id, Patient ID, Provider ID,
-                Primary Patient Insurance ID, Secondary Patient Insurance ID,
-                Department ID, Patient Department ID, Diagnosis1-Diagnosis8,
-                Referring Provider ID, Appointment ID, Current Illness Date,
-                Service Date, Supervising Provider ID, Status1/Status2/StatusP,
-                Outstanding1/2/P, LastBilledDate1/2/P, HealthcareClaimTypeID1/2
+        src: Synthea Claim model
 
     Returns:
-        Dictionary representing a FHIR Claim resource
+        FHIR R4 Claim resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    claim_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    patient_id = (
-        csv_row.get("Patient ID", "").strip() if csv_row.get("Patient ID") else ""
-    )
-    provider_id = (
-        csv_row.get("Provider ID", "").strip() if csv_row.get("Provider ID") else ""
-    )
-    primary_insurance_id = (
-        csv_row.get("Primary Patient Insurance ID", "").strip()
-        if csv_row.get("Primary Patient Insurance ID")
-        else ""
-    )
-    secondary_insurance_id = (
-        csv_row.get("Secondary Patient Insurance ID", "").strip()
-        if csv_row.get("Secondary Patient Insurance ID")
-        else ""
-    )
-    department_id = (
-        csv_row.get("Department ID", "").strip() if csv_row.get("Department ID") else ""
-    )
-    patient_department_id = (
-        csv_row.get("Patient Department ID", "").strip()
-        if csv_row.get("Patient Department ID")
-        else ""
-    )
-    appointment_id = (
-        csv_row.get("Appointment ID", "").strip()
-        if csv_row.get("Appointment ID")
-        else ""
-    )
-    current_illness_date = (
-        csv_row.get("Current Illness Date", "").strip()
-        if csv_row.get("Current Illness Date")
-        else ""
-    )
-    service_date = (
-        csv_row.get("Service Date", "").strip() if csv_row.get("Service Date") else ""
-    )
-    supervising_provider_id = (
-        csv_row.get("Supervising Provider ID", "").strip()
-        if csv_row.get("Supervising Provider ID")
-        else ""
-    )
-    healthcare_claim_type_id1 = (
-        csv_row.get("HealthcareClaimTypeID1", "").strip()
-        if csv_row.get("HealthcareClaimTypeID1")
-        else ""
-    )
-    healthcare_claim_type_id2 = (
-        csv_row.get("HealthcareClaimTypeID2", "").strip()
-        if csv_row.get("HealthcareClaimTypeID2")
-        else ""
-    )
+    # Extract and process fields (synthea_pydantic uses lowercase keys)
+    claim_id = to_str(d.get("id"))
+    patient_id = to_str(d.get("patientid"))
+    provider_id = to_str(d.get("providerid"))
+    primary_insurance_id = to_str(d.get("primarypatientinsuranceid"))
+    secondary_insurance_id = to_str(d.get("secondarypatientinsuranceid"))
+    department_id = to_str(d.get("departmentid"))
+    patient_department_id = to_str(d.get("patientdepartmentid"))
+    appointment_id = to_str(d.get("appointmentid"))
+    current_illness_date = to_str(d.get("currentillnessdate"))
+    service_date = to_str(d.get("servicedate"))
+    supervising_provider_id = to_str(d.get("supervisingproviderid"))
+    healthcare_claim_type_id1 = to_str(d.get("healthcareclaimtypeid1"))
+    healthcare_claim_type_id2 = to_str(d.get("healthcareclaimtypeid2"))
 
-    # Extract diagnosis codes (Diagnosis1-8)
+    # Extract diagnosis codes (diagnosis1-8)
     diagnoses = []
     for i in range(1, 9):
-        diag_key = f"Diagnosis{i}"
-        diag_code = csv_row.get(diag_key, "").strip() if csv_row.get(diag_key) else ""
+        diag_code = to_str(d.get(f"diagnosis{i}"))
         if diag_code:
             diagnoses.append(
                 {
@@ -95,35 +51,29 @@ def map_claim(csv_row: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-    # Extract status notes (Status1, Status2, StatusP)
+    # Extract status notes (status1, status2, statusp)
     status_notes = []
-    for status_key in ["Status1", "Status2", "StatusP"]:
-        status_value = (
-            csv_row.get(status_key, "").strip() if csv_row.get(status_key) else ""
-        )
+    for status_key in ["status1", "status2", "statusp"]:
+        status_value = to_str(d.get(status_key))
         if status_value:
             status_notes.append({"text": status_value})
 
-    # Extract outstanding amounts (Outstanding1, Outstanding2, OutstandingP)
+    # Extract outstanding amounts (outstanding1, outstanding2, outstandingp)
     outstanding_notes = []
-    for outstanding_key in ["Outstanding1", "Outstanding2", "OutstandingP"]:
-        outstanding_value = (
-            csv_row.get(outstanding_key, "").strip()
-            if csv_row.get(outstanding_key)
-            else ""
-        )
+    for outstanding_key in ["outstanding1", "outstanding2", "outstandingp"]:
+        outstanding_value = to_str(d.get(outstanding_key))
         if outstanding_value:
             outstanding_notes.append({"text": f"Outstanding: {outstanding_value}"})
 
-    # Extract billing events (LastBilledDate1, LastBilledDate2, LastBilledDateP)
+    # Extract billing events (lastbilleddate1, lastbilleddate2, lastbilleddatep)
     events = []
     billing_dates = [
-        ("LastBilledDate1", "bill-primary"),
-        ("LastBilledDate2", "bill-secondary"),
-        ("LastBilledDateP", "bill-patient"),
+        ("lastbilleddate1", "bill-primary"),
+        ("lastbilleddate2", "bill-secondary"),
+        ("lastbilleddatep", "bill-patient"),
     ]
     for date_key, event_code in billing_dates:
-        date_value = csv_row.get(date_key, "").strip() if csv_row.get(date_key) else ""
+        date_value = to_str(d.get(date_key))
         if date_value:
             iso_date = format_datetime(date_value)
             if iso_date:
@@ -162,11 +112,12 @@ def map_claim(csv_row: dict[str, Any]) -> dict[str, Any]:
     # Build base resource
     resource: dict[str, Any] = {
         "resourceType": "Claim",
-        "id": claim_id if claim_id else "",
+        "status": "active",
+        "use": "claim",
     }
 
-    # Set identifier (business identifier)
     if claim_id:
+        resource["id"] = claim_id
         resource["identifier"] = [{"system": "urn:synthea:claim", "value": claim_id}]
 
     # Set patient reference
@@ -225,7 +176,13 @@ def map_claim(csv_row: dict[str, Any]) -> dict[str, Any]:
     if appointment_id:
         encounter_ref = create_reference("Encounter", appointment_id)
         if encounter_ref:
-            resource["item"] = [{"encounter": [encounter_ref]}]
+            resource["item"] = [
+                {
+                    "sequence": 1,
+                    "productOrService": {"text": "Encounter"},
+                    "encounter": [encounter_ref],
+                }
+            ]
 
     # Set billablePeriod
     if service_date:
@@ -266,6 +223,16 @@ def map_claim(csv_row: dict[str, Any]) -> dict[str, Any]:
 
     if type_codings:
         resource["type"] = {"coding": type_codings}
+    else:
+        # Default type required by FHIR
+        resource["type"] = {
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/claim-type",
+                    "code": "professional",
+                }
+            ]
+        }
 
     if healthcare_claim_type_id2:
         resource["subType"] = {
@@ -286,4 +253,14 @@ def map_claim(csv_row: dict[str, Any]) -> dict[str, Any]:
     if notes:
         resource["note"] = notes
 
-    return resource
+    # Set priority (required in FHIR R4B)
+    resource["priority"] = {
+        "coding": [
+            {
+                "system": "http://terminology.hl7.org/CodeSystem/processpriority",
+                "code": "normal",
+            }
+        ]
+    }
+
+    return Claim(**resource)

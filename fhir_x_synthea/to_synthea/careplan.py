@@ -1,87 +1,128 @@
-"""
-Mapping function for converting FHIR CarePlan resources to Synthea careplans.csv rows.
-"""
+"""FHIR R4 CarePlan → Synthea CarePlan"""
 
-from typing import Any
+import logging
+from datetime import date
+
+from fhir.resources.careplan import CarePlan
+from synthea_pydantic import CarePlan as SyntheaCarePlan
 
 from ..synthea_csv_lib import (
     extract_coding_code,
     extract_display_or_text,
     extract_reference_id,
-    parse_datetime,
+    parse_datetime_to_date,
 )
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_careplan_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a FHIR R4 CarePlan resource to a Synthea careplans.csv row.
+
+def convert(src: CarePlan) -> SyntheaCarePlan:
+    """Convert FHIR R4 CarePlan to Synthea CarePlan.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR CarePlan resource
+        src: FHIR R4 CarePlan resource
 
     Returns:
-        Dictionary with CSV column names as keys (Id, Start, Stop, etc.)
-    """
+        Synthea CarePlan model
 
-    # Initialize CSV row
-    csv_row: dict[str, str] = {
-        "Id": "",
-        "Start": "",
-        "Stop": "",
-        "Patient": "",
-        "Encounter": "",
-        "Code": "",
-        "Description": "",
-        "ReasonCode": "",
-        "ReasonDescription": "",
-    }
+    Note:
+        Some FHIR fields may not be representable in Synthea format.
+        Check logs for warnings about dropped data.
+    """
+    fhir_resource = src.model_dump(exclude_none=True)
 
     # Extract Id
     resource_id = fhir_resource.get("id", "")
-    if resource_id:
-        csv_row["Id"] = resource_id
 
     # Extract Start and Stop from period
+    start = None
+    stop = None
     period = fhir_resource.get("period", {})
-    start = period.get("start")
-    if start:
-        csv_row["Start"] = parse_datetime(start)
+    start_str = period.get("start")
+    if start_str:
+        parsed = parse_datetime_to_date(start_str)
+        if parsed:
+            start = date.fromisoformat(parsed)
 
-    stop = period.get("end")
-    if stop:
-        csv_row["Stop"] = parse_datetime(stop)
+    stop_str = period.get("end")
+    if stop_str:
+        parsed = parse_datetime_to_date(stop_str)
+        if parsed:
+            stop = date.fromisoformat(parsed)
 
     # Extract Patient reference
+    patient = ""
     subject = fhir_resource.get("subject")
     if subject:
-        csv_row["Patient"] = extract_reference_id(subject)
+        patient = extract_reference_id(subject)
 
     # Extract Encounter reference
-    encounter = fhir_resource.get("encounter")
-    if encounter:
-        csv_row["Encounter"] = extract_reference_id(encounter)
+    encounter = ""
+    encounter_ref = fhir_resource.get("encounter")
+    if encounter_ref:
+        encounter = extract_reference_id(encounter_ref)
 
     # Extract Code from category (SNOMED)
+    code = ""
     categories = fhir_resource.get("category", [])
     if categories:
         first_category = categories[0]
-        csv_row["Code"] = extract_coding_code(first_category, "http://snomed.info/sct")
+        code = extract_coding_code(
+            first_category, preferred_system="http://snomed.info/sct"
+        )
 
     # Extract Description (prefer description, fallback to title)
     description = fhir_resource.get("description", "")
-    title = fhir_resource.get("title", "")
-    if description:
-        csv_row["Description"] = description
-    elif title:
-        csv_row["Description"] = title
+    if not description:
+        description = fhir_resource.get("title", "")
 
     # Extract ReasonCode and ReasonDescription
-    reason_codes = fhir_resource.get("reasonCode", [])
-    if reason_codes:
-        first_reason = reason_codes[0]
-        csv_row["ReasonCode"] = extract_coding_code(
-            first_reason, "http://snomed.info/sct"
-        )
-        csv_row["ReasonDescription"] = extract_display_or_text(first_reason)
+    reason_code = ""
+    reason_description = ""
 
-    return csv_row
+    # R4B uses addresses instead of reasonCode
+    addresses = fhir_resource.get("addresses", [])
+    if addresses:
+        first_address = addresses[0]
+        # Check if it's a CodeableReference (R4B) or CodeableConcept (R4)
+        if "concept" in first_address:
+            concept = first_address["concept"]
+            reason_code = extract_coding_code(
+                concept, preferred_system="http://snomed.info/sct"
+            )
+            reason_description = extract_display_or_text(concept)
+        else:
+            reason_code = extract_coding_code(
+                first_address, preferred_system="http://snomed.info/sct"
+            )
+            reason_description = extract_display_or_text(first_address)
+
+    # Fallback to reasonCode if addresses is empty
+    if not reason_code:
+        reason_codes = fhir_resource.get("reasonCode", [])
+        if reason_codes:
+            first_reason = reason_codes[0]
+            reason_code = extract_coding_code(
+                first_reason, preferred_system="http://snomed.info/sct"
+            )
+            reason_description = extract_display_or_text(first_reason)
+
+    # Log lossy conversions
+    if len(categories) > 1:
+        logger.warning(
+            "CarePlan %s has %d categories; only first preserved",
+            src.id,
+            len(categories),
+        )
+
+    return SyntheaCarePlan(
+        id=resource_id or None,
+        start=start,
+        stop=stop,
+        patient=patient or None,
+        encounter=encounter or None,
+        code=code or "unknown",
+        description=description or "Unknown care plan",
+        reasoncode=reason_code or None,
+        reasondescription=reason_description or None,
+    )

@@ -1,27 +1,31 @@
-"""
-Mapping functions for converting FHIR Claim and ClaimResponse resources to Synthea claims_transactions.csv rows.
-"""
+"""FHIR R4 Claim/ClaimResponse → Synthea ClaimTransaction"""
 
-from typing import Any
+import logging
+from decimal import Decimal
+
+from fhir.resources.claim import Claim
+from fhir.resources.claimresponse import ClaimResponse
+from synthea_pydantic import ClaimTransaction
 
 from ..synthea_csv_lib import extract_reference_id, parse_datetime_to_date
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_claim_to_transactions(
-    fhir_resource: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """
-    Map a FHIR R4 Claim resource to Synthea claims_transactions.csv rows.
+
+def convert(src: Claim) -> list[ClaimTransaction]:
+    """Convert FHIR R4 Claim to Synthea ClaimTransaction(s).
+
     Produces one CHARGE row per Claim.item.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR Claim resource
+        src: FHIR R4 Claim resource
 
     Returns:
-        List of dictionaries, each representing a CSV row
+        List of Synthea ClaimTransaction models
     """
+    fhir_resource = src.model_dump(exclude_none=True)
+    transactions = []
 
-    rows = []
     claim_id = fhir_resource.get("id", "")
 
     # Extract common fields
@@ -35,8 +39,10 @@ def map_fhir_claim_to_transactions(
     provider_id = extract_reference_id(provider) if provider else ""
 
     billable_period = fhir_resource.get("billablePeriod", {})
-    from_date = parse_datetime_to_date(billable_period.get("start"))
-    to_date = parse_datetime_to_date(billable_period.get("end"))
+    from_date_str = billable_period.get("start")
+    to_date_str = billable_period.get("end")
+    from_date = parse_datetime_to_date(from_date_str) if from_date_str else None
+    to_date = parse_datetime_to_date(to_date_str) if to_date_str else None
 
     insurance_list = fhir_resource.get("insurance", [])
     patient_insurance_id = ""
@@ -71,107 +77,119 @@ def map_fhir_claim_to_transactions(
         # Generate transaction ID
         transaction_id = f"txn-{claim_id}-{charge_id}"
 
-        row: dict[str, str] = {
-            "Id": transaction_id,
-            "Claim ID": claim_id,
-            "Charge ID": str(charge_id),
-            "Patient ID": patient_id,
-            "Type": "CHARGE",
-            "Amount": "",
-            "From Date": from_date,
-            "To Date": to_date,
-            "Place of Service": place_of_service,
-            "Procedure Code": "",
-            "Modifier1": "",
-            "Modifier2": "",
-            "DiagnosisRef1": "",
-            "DiagnosisRef2": "",
-            "DiagnosisRef3": "",
-            "DiagnosisRef4": "",
-            "Units": "",
-            "Unit Amount": "",
-            "Notes": notes_text,
-            "Line Note": "",
-            "Department ID": "",
-            "Fee Schedule ID": "",
-            "Appointment ID": "",
-            "Provider ID": provider_id,
-            "Supervising Provider ID": supervising_provider_id,
-            "Patient Insurance ID": patient_insurance_id,
-            "Method": "",
-            "Payments": "",
-            "Adjustments": "",
-            "Transfers": "",
-            "Transfer Out ID": "",
-            "Transfer Type": "",
-            "Outstanding": "",
-        }
-
         # Extract item-specific fields
         net = item.get("net", {})
-        if net.get("value") is not None:
-            row["Amount"] = str(net.get("value", ""))
+        amount = (
+            Decimal(str(net.get("value"))) if net.get("value") is not None else None
+        )
 
+        procedure_code = ""
         product_or_service = item.get("productOrService", {})
         codings = product_or_service.get("coding", [])
         if codings:
-            row["Procedure Code"] = codings[0].get("code", "")
+            procedure_code = codings[0].get("code", "")
+
+        line_note = ""
+        if codings and codings[0].get("display"):
+            line_note = codings[0].get("display", "")
 
         modifiers = item.get("modifier", [])
-        if len(modifiers) > 0:
-            row["Modifier1"] = modifiers[0].get("code", "")
-        if len(modifiers) > 1:
-            row["Modifier2"] = modifiers[1].get("code", "")
+        modifier1 = modifiers[0].get("code", "") if len(modifiers) > 0 else ""
+        modifier2 = modifiers[1].get("code", "") if len(modifiers) > 1 else ""
 
         diagnosis_sequences = item.get("diagnosisSequence", [])
-        for i, seq in enumerate(diagnosis_sequences[:4]):
-            row[f"DiagnosisRef{i+1}"] = str(seq)
+        diagnosisref1 = (
+            str(diagnosis_sequences[0]) if len(diagnosis_sequences) > 0 else None
+        )
+        diagnosisref2 = (
+            str(diagnosis_sequences[1]) if len(diagnosis_sequences) > 1 else None
+        )
+        diagnosisref3 = (
+            str(diagnosis_sequences[2]) if len(diagnosis_sequences) > 2 else None
+        )
+        diagnosisref4 = (
+            str(diagnosis_sequences[3]) if len(diagnosis_sequences) > 3 else None
+        )
 
         quantity = item.get("quantity", {})
-        if quantity.get("value") is not None:
-            row["Units"] = str(quantity.get("value", ""))
+        units = (
+            Decimal(str(quantity.get("value")))
+            if quantity.get("value") is not None
+            else None
+        )
 
         unit_price = item.get("unitPrice", {})
-        if unit_price.get("value") is not None:
-            row["Unit Amount"] = str(unit_price.get("value", ""))
+        unit_amount = (
+            Decimal(str(unit_price.get("value")))
+            if unit_price.get("value") is not None
+            else None
+        )
 
         encounters = item.get("encounter", [])
-        if encounters:
-            row["Appointment ID"] = extract_reference_id(encounters[0])
+        appointment_id = extract_reference_id(encounters[0]) if encounters else ""
 
         item_notes = item.get("note", [])
-        if item_notes:
-            row["Line Note"] = item_notes[0].get("text", "")
-
-        # Extract Department ID and Fee Schedule ID from item notes
+        department_id = ""
+        fee_schedule_id = ""
         for note in item_notes:
             note_text = note.get("text", "")
             if "Department ID:" in note_text:
-                row["Department ID"] = note_text.replace("Department ID:", "").strip()
+                department_id = note_text.replace("Department ID:", "").strip()
             elif "Fee Schedule ID:" in note_text:
-                row["Fee Schedule ID"] = note_text.replace(
-                    "Fee Schedule ID:", ""
-                ).strip()
+                fee_schedule_id = note_text.replace("Fee Schedule ID:", "").strip()
 
-        rows.append(row)
+        tx = ClaimTransaction(
+            id=transaction_id or None,
+            claimid=claim_id or None,
+            chargeid=int(charge_id) if charge_id is not None else None,
+            patientid=patient_id or None,
+            type="CHARGE",
+            amount=amount,
+            method=None,
+            fromdate=from_date,
+            todate=to_date,
+            placeofservice=place_of_service or None,
+            procedurecode=procedure_code or None,
+            modifier1=modifier1 or None,
+            modifier2=modifier2 or None,
+            diagnosisref1=diagnosisref1,
+            diagnosisref2=diagnosisref2,
+            diagnosisref3=diagnosisref3,
+            diagnosisref4=diagnosisref4,
+            units=units,
+            departmentid=department_id or None,
+            notes=notes_text or None,
+            unitamount=unit_amount,
+            transferoutid=None,
+            transfertype=None,
+            payments=None,
+            adjustments=None,
+            transfers=None,
+            outstanding=None,
+            appointmentid=appointment_id or None,
+            linenote=line_note or None,
+            patientinsuranceid=patient_insurance_id or None,
+            feescheduleid=fee_schedule_id or None,
+            providerid=provider_id or None,
+            supervisingproviderid=supervising_provider_id or None,
+        )
+        transactions.append(tx)
 
-    return rows
+    return transactions
 
 
-def map_fhir_claim_response_to_transactions(
-    fhir_resource: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """
-    Map a FHIR R4 ClaimResponse resource to Synthea claims_transactions.csv rows.
+def convert_response(src: ClaimResponse) -> list[ClaimTransaction]:
+    """Convert FHIR R4 ClaimResponse to Synthea ClaimTransaction(s).
 
     Args:
-        fhir_resource: Dictionary representing a FHIR ClaimResponse resource
+        src: FHIR R4 ClaimResponse resource
 
     Returns:
-        List of dictionaries, each representing a CSV row
+        List of Synthea ClaimTransaction models
     """
+    fhir_resource = src.model_dump(exclude_none=True)
+    transactions = []
 
-    rows = []
     transaction_id = fhir_resource.get("id", "")
 
     # Extract request reference (Claim ID)
@@ -193,7 +211,10 @@ def map_fhir_claim_response_to_transactions(
     elif payment_method_obj.get("text"):
         payment_method = payment_method_obj.get("text", "")
 
-    payment_date = parse_datetime_to_date(payment.get("date"))
+    payment_date_str = payment.get("date")
+    payment_date = (
+        parse_datetime_to_date(payment_date_str) if payment_date_str else None
+    )
 
     # Process items
     items = fhir_resource.get("item", [])
@@ -202,48 +223,39 @@ def map_fhir_claim_response_to_transactions(
 
         # Determine transaction type from adjudications
         transaction_type = ""
-        amount_value = ""
+        amount_value = None
+        transfers_value = None
+        transfer_out_id = ""
+        transfer_type = ""
 
         adjudications = item.get("adjudication", [])
         for adj in adjudications:
             category = adj.get("category", {})
-            codings = category.get("coding", [])
-            for coding in codings:
+            adj_codings = category.get("coding", [])
+            for coding in adj_codings:
                 code = coding.get("code", "")
                 if code in ("PAYMENT", "payment"):
                     transaction_type = "PAYMENT"
-                    amount_value = (
-                        str(adj.get("amount", {}).get("value", ""))
-                        if adj.get("amount")
-                        else ""
-                    )
+                    if adj.get("amount"):
+                        amount_value = Decimal(str(adj["amount"].get("value", 0)))
                     break
                 elif code in ("ADJUSTMENT", "adjustment"):
                     transaction_type = "ADJUSTMENT"
-                    amount_value = (
-                        str(adj.get("amount", {}).get("value", ""))
-                        if adj.get("amount")
-                        else ""
-                    )
+                    if adj.get("amount"):
+                        amount_value = Decimal(str(adj["amount"].get("value", 0)))
                     break
                 elif code in ("TRANSFERIN", "TRANSFEROUT", "transfer"):
                     transaction_type = (
                         "TRANSFERIN" if "IN" in code.upper() else "TRANSFEROUT"
                     )
-                    amount_value = (
-                        str(adj.get("amount", {}).get("value", ""))
-                        if adj.get("amount")
-                        else ""
-                    )
+                    if adj.get("amount"):
+                        transfers_value = Decimal(str(adj["amount"].get("value", 0)))
 
                     # Extract transfer details from reason
                     reason = adj.get("reason", {})
                     reason_text = reason.get("text", "")
-                    transfer_out_id = ""
-                    transfer_type = ""
 
                     if reason_text:
-                        # Parse "Transfer Out ID: xxx; Transfer Type: yyy"
                         parts = reason_text.split(";")
                         for part in parts:
                             if "Transfer Out ID:" in part:
@@ -254,105 +266,102 @@ def map_fhir_claim_response_to_transactions(
                                 transfer_type = part.replace(
                                     "Transfer Type:", ""
                                 ).strip()
-
                     break
 
         # If payment.amount present, override with PAYMENT
         if payment_amount is not None and not transaction_type:
             transaction_type = "PAYMENT"
-            amount_value = str(payment_amount)
+            amount_value = Decimal(str(payment_amount))
 
         # Extract outstanding from notes
-        outstanding = ""
+        outstanding = None
         item_notes = item.get("note", [])
         for note in item_notes:
             note_text = note.get("text", "")
             if "Outstanding:" in note_text:
-                outstanding = note_text.replace("Outstanding:", "").strip()
+                try:
+                    outstanding = Decimal(note_text.replace("Outstanding:", "").strip())
+                except (ValueError, TypeError, ArithmeticError):
+                    pass
 
-        row: dict[str, str] = {
-            "Id": transaction_id,
-            "Claim ID": claim_id,
-            "Charge ID": str(charge_id) if charge_id is not None else "",
-            "Patient ID": patient_id,
-            "Type": transaction_type,
-            "Amount": amount_value,
-            "From Date": payment_date,
-            "To Date": payment_date,
-            "Place of Service": "",
-            "Procedure Code": "",
-            "Modifier1": "",
-            "Modifier2": "",
-            "DiagnosisRef1": "",
-            "DiagnosisRef2": "",
-            "DiagnosisRef3": "",
-            "DiagnosisRef4": "",
-            "Units": "",
-            "Unit Amount": "",
-            "Notes": "",
-            "Line Note": "",
-            "Department ID": "",
-            "Fee Schedule ID": "",
-            "Appointment ID": "",
-            "Provider ID": "",
-            "Supervising Provider ID": "",
-            "Patient Insurance ID": "",
-            "Method": payment_method,
-            "Payments": str(payment_amount)
+        tx = ClaimTransaction(
+            id=transaction_id or None,
+            claimid=claim_id or None,
+            chargeid=int(charge_id) if charge_id is not None else None,
+            patientid=patient_id or None,
+            type=transaction_type or None,
+            amount=amount_value,
+            method=payment_method or None,
+            fromdate=payment_date,
+            todate=payment_date,
+            placeofservice=None,
+            procedurecode=None,
+            modifier1=None,
+            modifier2=None,
+            diagnosisref1=None,
+            diagnosisref2=None,
+            diagnosisref3=None,
+            diagnosisref4=None,
+            units=None,
+            departmentid=None,
+            notes=None,
+            unitamount=None,
+            transferoutid=transfer_out_id or None,
+            transfertype=transfer_type or None,
+            payments=Decimal(str(payment_amount))
             if transaction_type == "PAYMENT" and payment_amount is not None
-            else "",
-            "Adjustments": amount_value if transaction_type == "ADJUSTMENT" else "",
-            "Transfers": amount_value
+            else None,
+            adjustments=amount_value if transaction_type == "ADJUSTMENT" else None,
+            transfers=transfers_value
             if transaction_type in ("TRANSFERIN", "TRANSFEROUT")
-            else "",
-            "Transfer Out ID": transfer_out_id
-            if transaction_type in ("TRANSFERIN", "TRANSFEROUT")
-            else "",
-            "Transfer Type": transfer_type
-            if transaction_type in ("TRANSFERIN", "TRANSFEROUT")
-            else "",
-            "Outstanding": outstanding,
-        }
+            else None,
+            outstanding=outstanding,
+            appointmentid=None,
+            linenote=None,
+            patientinsuranceid=None,
+            feescheduleid=None,
+            providerid=None,
+            supervisingproviderid=None,
+        )
+        transactions.append(tx)
 
-        rows.append(row)
+    # If no items, create one transaction from payment info
+    if not transactions and payment_amount is not None:
+        tx = ClaimTransaction(
+            id=transaction_id or None,
+            claimid=claim_id or None,
+            chargeid=None,
+            patientid=patient_id or None,
+            type="PAYMENT",
+            amount=None,
+            method=payment_method or None,
+            fromdate=payment_date,
+            todate=payment_date,
+            placeofservice=None,
+            procedurecode=None,
+            modifier1=None,
+            modifier2=None,
+            diagnosisref1=None,
+            diagnosisref2=None,
+            diagnosisref3=None,
+            diagnosisref4=None,
+            units=None,
+            departmentid=None,
+            notes=None,
+            unitamount=None,
+            transferoutid=None,
+            transfertype=None,
+            payments=Decimal(str(payment_amount)),
+            adjustments=None,
+            transfers=None,
+            outstanding=None,
+            appointmentid=None,
+            linenote=None,
+            patientinsuranceid=None,
+            feescheduleid=None,
+            providerid=None,
+            supervisingproviderid=None,
+        )
+        transactions.append(tx)
 
-    # If no items, create one row from payment info
-    if not rows and payment_amount is not None:
-        row = {
-            "Id": transaction_id,
-            "Claim ID": claim_id,
-            "Charge ID": "",
-            "Patient ID": patient_id,
-            "Type": "PAYMENT",
-            "Amount": "",
-            "From Date": payment_date,
-            "To Date": payment_date,
-            "Place of Service": "",
-            "Procedure Code": "",
-            "Modifier1": "",
-            "Modifier2": "",
-            "DiagnosisRef1": "",
-            "DiagnosisRef2": "",
-            "DiagnosisRef3": "",
-            "DiagnosisRef4": "",
-            "Units": "",
-            "Unit Amount": "",
-            "Notes": "",
-            "Line Note": "",
-            "Department ID": "",
-            "Fee Schedule ID": "",
-            "Appointment ID": "",
-            "Provider ID": "",
-            "Supervising Provider ID": "",
-            "Patient Insurance ID": "",
-            "Method": payment_method,
-            "Payments": str(payment_amount),
-            "Adjustments": "",
-            "Transfers": "",
-            "Transfer Out ID": "",
-            "Transfer Type": "",
-            "Outstanding": "",
-        }
-        rows.append(row)
-
-    return rows
+    return transactions

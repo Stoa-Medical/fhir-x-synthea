@@ -1,142 +1,133 @@
-"""
-Mapping function for converting Synthea encounters.csv rows to FHIR Encounter resources.
-"""
+"""Synthea Encounter → FHIR R4 Encounter"""
 
 from typing import Any
 
-from ..fhir_lib import create_reference, format_datetime, map_encounter_class
+from fhir.resources.encounter import Encounter
+from synthea_pydantic import Encounter as SyntheaEncounter
+
+from ..fhir_lib import create_reference, format_datetime
+from ..utils import to_str
 
 
-def map_encounter(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea encounters.csv row to a FHIR R4 Encounter resource.
+def _map_encounter_class(class_str: str) -> dict[str, Any] | None:
+    """Map Synthea encounter class string to FHIR CodeableConcept structure."""
+    if not class_str:
+        return None
+    class_lower = class_str.lower().strip()
+    class_map = {
+        "ambulatory": {"code": "AMB", "display": "ambulatory"},
+        "emergency": {"code": "EMER", "display": "emergency"},
+        "inpatient": {"code": "IMP", "display": "inpatient encounter"},
+        "wellness": {"code": "AMB", "display": "ambulatory"},
+        "urgentcare": {"code": "AMB", "display": "ambulatory"},
+    }
+    mapping = class_map.get(class_lower)
+    if not mapping:
+        return None
+    return {
+        "coding": [
+            {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                **mapping,
+            }
+        ]
+    }
+
+
+def convert(
+    src: SyntheaEncounter,
+    *,
+    patient_ref: str | None = None,
+    provider_ref: str | None = None,
+    organization_ref: str | None = None,
+) -> Encounter:
+    """Convert Synthea Encounter to FHIR R4 Encounter.
 
     Args:
-        csv_row: Dictionary with keys like Id, Start, Stop, Patient, Organization,
-                Provider, EncounterClass, Code, Description, ReasonCode,
-                ReasonDescription, Payer, Base_Encounter_Cost, Total_Claim_Cost, Payer_Coverage
+        src: Synthea Encounter model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
+        provider_ref: Optional provider reference (e.g., "Practitioner/456")
+        organization_ref: Optional organization reference (e.g., "Organization/789")
 
     Returns:
-        Dictionary representing a FHIR Encounter resource
+        FHIR R4 Encounter resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    encounter_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    start = csv_row.get("Start", "").strip() if csv_row.get("Start") else ""
-    stop = csv_row.get("Stop", "").strip() if csv_row.get("Stop") else ""
-    patient_id = csv_row.get("Patient", "").strip() if csv_row.get("Patient") else ""
-    organization_id = (
-        csv_row.get("Organization", "").strip() if csv_row.get("Organization") else ""
-    )
-    provider_id = csv_row.get("Provider", "").strip() if csv_row.get("Provider") else ""
-    encounter_class = (
-        csv_row.get("EncounterClass", "").strip()
-        if csv_row.get("EncounterClass")
-        else ""
-    )
-    code = csv_row.get("Code", "").strip() if csv_row.get("Code") else ""
-    description = (
-        csv_row.get("Description", "").strip() if csv_row.get("Description") else ""
-    )
-    reason_code = (
-        csv_row.get("ReasonCode", "").strip() if csv_row.get("ReasonCode") else ""
-    )
-    reason_description = (
-        csv_row.get("ReasonDescription", "").strip()
-        if csv_row.get("ReasonDescription")
-        else ""
-    )
-    payer_id = csv_row.get("Payer", "").strip() if csv_row.get("Payer") else ""
-    base_cost_str = (
-        csv_row.get("Base_Encounter_Cost", "").strip()
-        if csv_row.get("Base_Encounter_Cost")
-        else ""
-    )
-    total_cost_str = (
-        csv_row.get("Total_Claim_Cost", "").strip()
-        if csv_row.get("Total_Claim_Cost")
-        else ""
-    )
-    payer_coverage_str = (
-        csv_row.get("Payer_Coverage", "").strip()
-        if csv_row.get("Payer_Coverage")
-        else ""
-    )
+    # Extract and process fields (synthea_pydantic uses lowercase keys)
+    encounter_id = to_str(d.get("id"))
+    start = to_str(d.get("start"))
+    stop = to_str(d.get("stop"))
+    patient_id = to_str(d.get("patient"))
+    organization_id = to_str(d.get("organization"))
+    provider_id = to_str(d.get("provider"))
+    encounter_class = to_str(d.get("encounterclass"))
+    code = to_str(d.get("code"))
+    description = to_str(d.get("description"))
+    reason_code = to_str(d.get("reasoncode"))
+    reason_description = to_str(d.get("reasondescription"))
+    payer_id = to_str(d.get("payer"))
 
-    # Parse numeric costs
-    base_cost = None
-    if base_cost_str:
-        try:
-            base_cost = float(base_cost_str)
-        except (ValueError, TypeError):
-            pass
+    # Handle numeric fields
+    base_cost = d.get("base_encounter_cost")
+    total_cost = d.get("total_claim_cost")
+    payer_coverage = d.get("payer_coverage")
 
-    total_cost = None
-    if total_cost_str:
-        try:
-            total_cost = float(total_cost_str)
-        except (ValueError, TypeError):
-            pass
-
-    payer_coverage = None
-    if payer_coverage_str:
-        try:
-            payer_coverage = float(payer_coverage_str)
-        except (ValueError, TypeError):
-            pass
-
-    # Determine status based on STOP field
-    status = "finished" if (stop and stop != "") else "in-progress"
-
-    # Generate resource ID (use Id if present)
-    resource_id = (
-        encounter_id
-        if encounter_id
-        else f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
-    )
+    # Determine status based on stop field
+    status = "completed" if stop else "in-progress"
 
     # Build base resource
     resource: dict[str, Any] = {
         "resourceType": "Encounter",
-        "id": resource_id,
         "status": status,
     }
 
-    # Set period
-    period: dict[str, Any] = {}
+    # Set id if present (generate if not)
+    if encounter_id:
+        resource["id"] = encounter_id
+    else:
+        resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
+        if resource_id and resource_id != "--":
+            resource["id"] = resource_id
+
+    # Set actualPeriod (fhir.resources 8.x uses actualPeriod instead of period)
+    actual_period: dict[str, Any] = {}
     if start:
         iso_start = format_datetime(start)
         if iso_start:
-            period["start"] = iso_start
+            actual_period["start"] = iso_start
     if stop:
         iso_stop = format_datetime(stop)
         if iso_stop:
-            period["end"] = iso_stop
-    if period:
-        resource["period"] = period
+            actual_period["end"] = iso_stop
+    if actual_period:
+        resource["actualPeriod"] = actual_period
 
-    # Set subject (patient) reference (required)
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["subject"] = patient_ref
+    # Set subject (patient) reference - use override or from source
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    if effective_patient_ref:
+        resource["subject"] = {"reference": effective_patient_ref}
 
-    # Set serviceProvider (organization) reference (required)
-    if organization_id:
-        org_ref = create_reference("Organization", organization_id)
-        if org_ref:
-            resource["serviceProvider"] = org_ref
+    # Set serviceProvider (organization) reference - use override or from source
+    effective_org_ref = organization_ref or (
+        f"Organization/{organization_id}" if organization_id else None
+    )
+    if effective_org_ref:
+        resource["serviceProvider"] = {"reference": effective_org_ref}
 
-    # Set participant (provider) reference (required)
-    if provider_id:
-        provider_ref = create_reference("Practitioner", provider_id)
-        if provider_ref:
-            resource["participant"] = [{"individual": provider_ref}]
+    # Set participant (provider) - fhir.resources 8.x uses actor instead of individual
+    effective_provider_ref = provider_ref or (
+        f"Practitioner/{provider_id}" if provider_id else None
+    )
+    if effective_provider_ref:
+        resource["participant"] = [{"actor": {"reference": effective_provider_ref}}]
 
-    # Set class
-    class_coding = map_encounter_class(encounter_class)
+    # Set class_fhir (fhir.resources uses class_fhir, expects list of CodeableConcept)
+    class_coding = _map_encounter_class(encounter_class)
     if class_coding:
-        resource["class"] = class_coding
+        resource["class_fhir"] = [class_coding]
 
     # Set type (SNOMED CT)
     if code or description:
@@ -151,30 +142,30 @@ def map_encounter(csv_row: dict[str, Any]) -> dict[str, Any]:
         if type_obj:
             resource["type"] = [type_obj]
 
-    # Set reasonCode
+    # Set reason (R4B uses reason with CodeableReference structure)
     if reason_code or reason_description:
-        reason_code_obj: dict[str, Any] = {}
+        concept: dict[str, Any] = {}
         if reason_code:
             coding = {"system": "http://snomed.info/sct", "code": reason_code}
             if reason_description:
                 coding["display"] = reason_description
-            reason_code_obj["coding"] = [coding]
-        if reason_description and not reason_code:
-            reason_code_obj["text"] = reason_description
-        if reason_code_obj:
-            resource["reasonCode"] = [reason_code_obj]
+            concept["coding"] = [coding]
+        if reason_description:
+            concept["text"] = reason_description
+        if concept:
+            resource["reason"] = [{"value": [{"concept": concept}]}]
 
     # Set extensions for payer and costs
     extensions: list[dict[str, Any]] = []
 
     # Payer extension
     if payer_id:
-        payer_ref = create_reference("Organization", payer_id)
-        if payer_ref:
+        payer_ref_obj = create_reference("Organization", payer_id)
+        if payer_ref_obj:
             extensions.append(
                 {
                     "url": "http://example.org/fhir/StructureDefinition/encounter-payer",
-                    "valueReference": payer_ref,
+                    "valueReference": payer_ref_obj,
                 }
             )
 
@@ -183,7 +174,7 @@ def map_encounter(csv_row: dict[str, Any]) -> dict[str, Any]:
         extensions.append(
             {
                 "url": "http://example.org/fhir/StructureDefinition/encounter-baseCost",
-                "valueDecimal": base_cost,
+                "valueDecimal": float(base_cost),
             }
         )
 
@@ -191,7 +182,7 @@ def map_encounter(csv_row: dict[str, Any]) -> dict[str, Any]:
         extensions.append(
             {
                 "url": "http://example.org/fhir/StructureDefinition/encounter-totalClaimCost",
-                "valueDecimal": total_cost,
+                "valueDecimal": float(total_cost),
             }
         )
 
@@ -199,11 +190,11 @@ def map_encounter(csv_row: dict[str, Any]) -> dict[str, Any]:
         extensions.append(
             {
                 "url": "http://example.org/fhir/StructureDefinition/encounter-payerCoverage",
-                "valueDecimal": payer_coverage,
+                "valueDecimal": float(payer_coverage),
             }
         )
 
     if extensions:
         resource["extension"] = extensions
 
-    return resource
+    return Encounter(**resource)

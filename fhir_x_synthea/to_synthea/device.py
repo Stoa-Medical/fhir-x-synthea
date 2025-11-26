@@ -1,80 +1,104 @@
-"""
-Mapping function for converting FHIR Device resources to Synthea devices.csv rows.
-"""
+"""FHIR R4 Device → Synthea Device"""
 
-from typing import Any
+import logging
+from datetime import date
+
+from fhir.resources.device import Device
+from synthea_pydantic import Device as SyntheaDevice
 
 from ..synthea_csv_lib import (
     extract_coding_code,
     extract_display_or_text,
     extract_extension_period,
     extract_extension_reference,
-    extract_reference_id,
-    parse_datetime,
+    parse_datetime_to_date,
 )
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_device_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a FHIR R4 Device resource to a Synthea devices.csv row.
+
+def convert(src: Device) -> SyntheaDevice:
+    """Convert FHIR R4 Device to Synthea Device.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR Device resource
+        src: FHIR R4 Device resource
 
     Returns:
-        Dictionary with CSV column names as keys (START, STOP, PATIENT, etc.)
-    """
+        Synthea Device model
 
-    # Initialize CSV row
-    csv_row: dict[str, str] = {
-        "START": "",
-        "STOP": "",
-        "PATIENT": "",
-        "ENCOUNTER": "",
-        "CODE": "",
-        "DESCRIPTION": "",
-        "UDI": "",
-    }
+    Note:
+        Some FHIR fields may not be representable in Synthea format.
+        Check logs for warnings about dropped data.
+    """
+    fhir_resource = src.model_dump(exclude_none=True)
 
     # Extract START and STOP from device-use-period extension
+    start = None
+    stop = None
     device_period = extract_extension_period(
         fhir_resource, "http://synthea.tools/fhir/StructureDefinition/device-use-period"
     )
 
     if device_period:
-        start = device_period.get("start")
-        if start:
-            csv_row["START"] = parse_datetime(start)
+        start_str = device_period.get("start")
+        if start_str:
+            parsed = parse_datetime_to_date(start_str)
+            if parsed:
+                start = date.fromisoformat(parsed)
 
-        stop = device_period.get("end")
-        if stop:
-            csv_row["STOP"] = parse_datetime(stop)
+        stop_str = device_period.get("end")
+        if stop_str:
+            parsed = parse_datetime_to_date(stop_str)
+            if parsed:
+                stop = date.fromisoformat(parsed)
 
-    # Extract PATIENT reference
-    patient = fhir_resource.get("patient")
-    if patient:
-        csv_row["PATIENT"] = extract_reference_id(patient)
+    # Extract PATIENT from extension
+    patient = extract_extension_reference(
+        fhir_resource, "http://hl7.org/fhir/StructureDefinition/resource-patient"
+    )
 
     # Extract ENCOUNTER from extension
-    csv_row["ENCOUNTER"] = extract_extension_reference(
+    encounter = extract_extension_reference(
         fhir_resource, "http://hl7.org/fhir/StructureDefinition/resource-encounter"
     )
 
     # Extract CODE and DESCRIPTION from type
+    # R4B Device.type is a list of CodeableConcept
+    code = ""
+    description = ""
     device_type = fhir_resource.get("type")
     if device_type:
-        csv_row["CODE"] = extract_coding_code(device_type, "http://snomed.info/sct")
-        csv_row["DESCRIPTION"] = extract_display_or_text(device_type)
+        # Handle list (R4B) or single (R4)
+        if isinstance(device_type, list) and device_type:
+            first_type = device_type[0]
+            code = extract_coding_code(
+                first_type, preferred_system="http://snomed.info/sct"
+            )
+            description = extract_display_or_text(first_type)
+        elif isinstance(device_type, dict):
+            code = extract_coding_code(
+                device_type, preferred_system="http://snomed.info/sct"
+            )
+            description = extract_display_or_text(device_type)
 
     # Extract UDI (prefer deviceIdentifier, fallback to carrierHRF)
+    udi = ""
     udi_carriers = fhir_resource.get("udiCarrier", [])
     if udi_carriers:
         first_udi = udi_carriers[0]
         device_identifier = first_udi.get("deviceIdentifier", "")
         carrier_hrf = first_udi.get("carrierHRF", "")
         if device_identifier:
-            csv_row["UDI"] = device_identifier
+            udi = device_identifier
         elif carrier_hrf:
-            csv_row["UDI"] = carrier_hrf
+            udi = carrier_hrf
 
-    return csv_row
+    return SyntheaDevice(
+        start=start,
+        stop=stop,
+        patient=patient or None,
+        encounter=encounter or None,
+        code=code or "unknown",
+        description=description or "Unknown device",
+        udi=udi or None,
+    )

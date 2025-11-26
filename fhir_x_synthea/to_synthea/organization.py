@@ -1,71 +1,71 @@
-"""
-Mapping function for converting FHIR Organization resources to Synthea organizations.csv rows.
-"""
+"""FHIR R4 Organization → Synthea Organization"""
 
+import logging
+from decimal import Decimal
 from typing import Any
+
+from fhir.resources.organization import Organization
+from synthea_pydantic import Organization as SyntheaOrganization
 
 from ..synthea_csv_lib import extract_nested_extension
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_organization_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a FHIR R4 Organization resource to a Synthea organizations.csv row.
+
+def _extract_geolocation(
+    address: dict[str, Any] | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    """Extract lat/lon from address extension."""
+    if not address:
+        return (None, None)
+
+    extensions = address.get("extension", [])
+    for ext in extensions:
+        if ext.get("url") == "http://hl7.org/fhir/StructureDefinition/geolocation":
+            sub_extensions = ext.get("extension", [])
+            lat = None
+            lon = None
+            for sub_ext in sub_extensions:
+                url = sub_ext.get("url", "")
+                value = sub_ext.get("valueDecimal")
+                if value is not None:
+                    if url == "latitude":
+                        lat = Decimal(str(value))
+                    elif url == "longitude":
+                        lon = Decimal(str(value))
+            return (lat, lon)
+    return (None, None)
+
+
+def convert(src: Organization) -> SyntheaOrganization:
+    """Convert FHIR R4 Organization to Synthea Organization.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR Organization resource
+        src: FHIR R4 Organization resource
 
     Returns:
-        Dictionary with CSV column names as keys (Id, Name, Address, etc.)
+        Synthea Organization model
+
+    Note:
+        Some FHIR fields may not be representable in Synthea format.
+        Check logs for warnings about dropped data.
     """
-
-    # Helper to extract geolocation from address extension
-    def extract_geolocation(address: dict[str, Any] | None) -> tuple[str, str]:
-        if not address:
-            return ("", "")
-
-        extensions = address.get("extension", [])
-        for ext in extensions:
-            if ext.get("url") == "http://hl7.org/fhir/StructureDefinition/geolocation":
-                sub_extensions = ext.get("extension", [])
-                lat = ""
-                lon = ""
-                for sub_ext in sub_extensions:
-                    url = sub_ext.get("url", "")
-                    value = sub_ext.get("valueDecimal")
-                    if value is not None:
-                        if url == "latitude":
-                            lat = str(value)
-                        elif url == "longitude":
-                            lon = str(value)
-                return (lat, lon)
-        return ("", "")
-
-    # Initialize CSV row
-    csv_row: dict[str, str] = {
-        "Id": "",
-        "Name": "",
-        "Address": "",
-        "City": "",
-        "State": "",
-        "Zip": "",
-        "Lat": "",
-        "Lon": "",
-        "Phone": "",
-        "Revenue": "",
-        "Utilization": "",
-    }
+    fhir_resource = src.model_dump(exclude_none=True)
 
     # Extract Id
     resource_id = fhir_resource.get("id", "")
-    if resource_id:
-        csv_row["Id"] = resource_id
 
     # Extract Name
     name = fhir_resource.get("name", "")
-    if name:
-        csv_row["Name"] = name
 
     # Extract Address components
+    address = ""
+    city = ""
+    state = ""
+    zip_code = ""
+    lat = None
+    lon = None
+
     addresses = fhir_resource.get("address", [])
     if addresses:
         first_address = addresses[0]
@@ -73,16 +73,14 @@ def map_fhir_organization_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any
         # Address line
         lines = first_address.get("line", [])
         if lines:
-            csv_row["Address"] = lines[0]
+            address = lines[0]
 
-        csv_row["City"] = first_address.get("city", "")
-        csv_row["State"] = first_address.get("state", "")
-        csv_row["Zip"] = first_address.get("postalCode", "")
+        city = first_address.get("city", "")
+        state = first_address.get("state", "")
+        zip_code = first_address.get("postalCode", "")
 
         # Geolocation
-        lat, lon = extract_geolocation(first_address)
-        csv_row["Lat"] = lat
-        csv_row["Lon"] = lon
+        lat, lon = _extract_geolocation(first_address)
 
     # Extract Phone numbers (join with ; )
     telecom = fhir_resource.get("telecom", [])
@@ -93,21 +91,43 @@ def map_fhir_organization_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any
             if value:
                 phones.append(value)
 
-    if phones:
-        csv_row["Phone"] = "; ".join(phones)
+    phone = "; ".join(phones) if phones else ""
 
     # Extract organization stats extensions
-    csv_row["Revenue"] = extract_nested_extension(
+    revenue_str = extract_nested_extension(
         fhir_resource,
         "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
         "revenue",
         "valueDecimal",
     )
-    csv_row["Utilization"] = extract_nested_extension(
+    utilization_str = extract_nested_extension(
         fhir_resource,
         "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
         "utilization",
         "valueInteger",
     )
 
-    return csv_row
+    revenue = Decimal(revenue_str) if revenue_str else None
+    utilization = int(utilization_str) if utilization_str else None
+
+    # Log lossy conversions
+    if len(addresses) > 1:
+        logger.warning(
+            "Organization %s has %d addresses; only first preserved",
+            src.id,
+            len(addresses),
+        )
+
+    return SyntheaOrganization(
+        id=resource_id or None,
+        name=name or "Unknown Organization",
+        address=address or None,
+        city=city or None,
+        state=state or None,
+        zip=zip_code or None,
+        lat=lat,
+        lon=lon,
+        phone=phone or None,
+        revenue=revenue,
+        utilization=utilization,
+    )

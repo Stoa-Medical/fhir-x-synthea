@@ -1,96 +1,54 @@
-"""
-Mapping function for converting Synthea medications.csv rows to FHIR MedicationRequest resources.
-"""
+"""Synthea Medication → FHIR R4 MedicationRequest"""
 
 from typing import Any
 
-from ..fhir_lib import create_reference, format_datetime
+from fhir.resources.medicationrequest import MedicationRequest
+from synthea_pydantic import Medication as SyntheaMedication
+
+from ..fhir_lib import format_datetime
+from ..utils import to_str
 
 
-def map_medication(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea medications.csv row to a FHIR R4 MedicationRequest resource.
+def convert(
+    src: SyntheaMedication,
+    *,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+) -> MedicationRequest:
+    """Convert Synthea Medication to FHIR R4 MedicationRequest.
 
     Args:
-        csv_row: Dictionary with keys like Start, Stop, Patient, Encounter, Payer,
-                Code, Description, Dispenses, ReasonCode, ReasonDescription,
-                Base_Cost, Payer_Coverage, TotalCost
+        src: Synthea Medication model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
+        encounter_ref: Optional encounter reference (e.g., "Encounter/456")
 
     Returns:
-        Dictionary representing a FHIR MedicationRequest resource
+        FHIR R4 MedicationRequest resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    start = csv_row.get("Start", "").strip() if csv_row.get("Start") else ""
-    stop = csv_row.get("Stop", "").strip() if csv_row.get("Stop") else ""
-    patient_id = csv_row.get("Patient", "").strip() if csv_row.get("Patient") else ""
-    encounter_id = (
-        csv_row.get("Encounter", "").strip() if csv_row.get("Encounter") else ""
-    )
-    payer_id = csv_row.get("Payer", "").strip() if csv_row.get("Payer") else ""
-    code = csv_row.get("Code", "").strip() if csv_row.get("Code") else ""
-    description = (
-        csv_row.get("Description", "").strip() if csv_row.get("Description") else ""
-    )
-    dispenses_str = (
-        csv_row.get("Dispenses", "").strip() if csv_row.get("Dispenses") else ""
-    )
-    reason_code = (
-        csv_row.get("ReasonCode", "").strip() if csv_row.get("ReasonCode") else ""
-    )
-    reason_description = (
-        csv_row.get("ReasonDescription", "").strip()
-        if csv_row.get("ReasonDescription")
-        else ""
-    )
-    base_cost_str = (
-        csv_row.get("Base_Cost", "").strip() if csv_row.get("Base_Cost") else ""
-    )
-    payer_coverage_str = (
-        csv_row.get("Payer_Coverage", "").strip()
-        if csv_row.get("Payer_Coverage")
-        else ""
-    )
-    total_cost_str = (
-        csv_row.get("TotalCost", "").strip() if csv_row.get("TotalCost") else ""
-    )
+    # Extract fields
+    start = to_str(d.get("start"))
+    stop = to_str(d.get("stop"))
+    patient_id = to_str(d.get("patient"))
+    encounter_id = to_str(d.get("encounter"))
+    payer_id = to_str(d.get("payer"))
+    code = to_str(d.get("code"))
+    description = to_str(d.get("description"))
+    dispenses = d.get("dispenses")
+    reason_code = to_str(d.get("reasoncode"))
+    reason_description = to_str(d.get("reasondescription"))
+    base_cost = d.get("base_cost")
+    payer_coverage = d.get("payer_coverage")
+    total_cost = d.get("totalcost")
 
-    # Parse numeric fields
-    dispenses = None
-    if dispenses_str:
-        try:
-            dispenses = int(dispenses_str)
-        except (ValueError, TypeError):
-            pass
+    # Determine status
+    status = "active" if not stop else "completed"
 
-    base_cost = None
-    if base_cost_str:
-        try:
-            base_cost = float(base_cost_str)
-        except (ValueError, TypeError):
-            pass
-
-    payer_coverage = None
-    if payer_coverage_str:
-        try:
-            payer_coverage = float(payer_coverage_str)
-        except (ValueError, TypeError):
-            pass
-
-    total_cost = None
-    if total_cost_str:
-        try:
-            total_cost = float(total_cost_str)
-        except (ValueError, TypeError):
-            pass
-
-    # Determine status based on STOP field
-    status = "active" if (not stop or stop == "") else "completed"
-
-    # Generate resource ID from Patient+Start+Code
+    # Generate resource ID
     resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
 
-    # Build base resource
+    # Build resource
     resource: dict[str, Any] = {
         "resourceType": "MedicationRequest",
         "id": resource_id,
@@ -98,76 +56,63 @@ def map_medication(csv_row: dict[str, Any]) -> dict[str, Any]:
         "intent": "order",
     }
 
-    # Set authoredOn from Start
+    # Set authoredOn
     if start:
         iso_start = format_datetime(start)
         if iso_start:
             resource["authoredOn"] = iso_start
 
-    # Set occurrencePeriod
-    occurrence_period: dict[str, Any] = {}
-    if start:
-        iso_start = format_datetime(start)
-        if iso_start:
-            occurrence_period["start"] = iso_start
-    if stop:
-        iso_stop = format_datetime(stop)
-        if iso_stop:
-            occurrence_period["end"] = iso_stop
+    # Set subject reference
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    if effective_patient_ref:
+        resource["subject"] = {"reference": effective_patient_ref}
 
-    if occurrence_period:
-        resource["occurrencePeriod"] = occurrence_period
+    # Set encounter reference
+    effective_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+    if effective_encounter_ref:
+        resource["encounter"] = {"reference": effective_encounter_ref}
 
-    # Set subject (patient) reference (required)
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["subject"] = patient_ref
-
-    # Set encounter reference (required)
-    if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource["encounter"] = encounter_ref
-
-    # Set insurance (payer) reference
+    # Set insurance reference
     if payer_id:
-        payer_ref = create_reference("Coverage", payer_id)
-        if payer_ref:
-            resource["insurance"] = [payer_ref]
+        resource["insurance"] = [{"reference": f"Coverage/{payer_id}"}]
 
-    # Set medicationCodeableConcept (RxNorm)
+    # Set medication (RxNorm)
     if code or description:
         medication_code: dict[str, Any] = {}
         if code:
-            coding = {
-                "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-                "code": code,
-            }
-            if description:
-                coding["display"] = description
-            medication_code["coding"] = [coding]
+            medication_code["coding"] = [
+                {
+                    "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                    "code": code,
+                    "display": description or None,
+                }
+            ]
         if description:
             medication_code["text"] = description
-        if medication_code:
-            resource["medicationCodeableConcept"] = medication_code
+        resource["medication"] = {"concept": medication_code}
 
-    # Set dispenseRequest.numberOfRepeatsAllowed
+    # Set dispense request
     if dispenses is not None:
-        resource["dispenseRequest"] = {"numberOfRepeatsAllowed": dispenses}
+        resource["dispenseRequest"] = {"numberOfRepeatsAllowed": int(dispenses)}
 
-    # Set reasonCode
+    # Set reason (R4B uses reason with CodeableReference)
     if reason_code or reason_description:
-        reason_code_obj: dict[str, Any] = {}
+        concept: dict[str, Any] = {}
         if reason_code:
-            coding = {"system": "http://snomed.info/sct", "code": reason_code}
-            if reason_description:
-                coding["display"] = reason_description
-            reason_code_obj["coding"] = [coding]
-        if reason_description and not reason_code:
-            reason_code_obj["text"] = reason_description
-        if reason_code_obj:
-            resource["reasonCode"] = [reason_code_obj]
+            concept["coding"] = [
+                {
+                    "system": "http://snomed.info/sct",
+                    "code": reason_code,
+                    "display": reason_description or None,
+                }
+            ]
+        if reason_description:
+            concept["text"] = reason_description
+        resource["reason"] = [{"concept": concept}]
 
     # Set financial extensions
     extensions = []
@@ -175,25 +120,24 @@ def map_medication(csv_row: dict[str, Any]) -> dict[str, Any]:
         extensions.append(
             {
                 "url": "http://synthea.org/fhir/StructureDefinition/medication-baseCost",
-                "valueDecimal": base_cost,
+                "valueDecimal": float(base_cost),
             }
         )
     if payer_coverage is not None:
         extensions.append(
             {
                 "url": "http://synthea.org/fhir/StructureDefinition/medication-payerCoverage",
-                "valueDecimal": payer_coverage,
+                "valueDecimal": float(payer_coverage),
             }
         )
     if total_cost is not None:
         extensions.append(
             {
                 "url": "http://synthea.org/fhir/StructureDefinition/medication-totalCost",
-                "valueDecimal": total_cost,
+                "valueDecimal": float(total_cost),
             }
         )
-
     if extensions:
         resource["extension"] = extensions
 
-    return resource
+    return MedicationRequest(**resource)

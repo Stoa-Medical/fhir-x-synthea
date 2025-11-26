@@ -1,111 +1,170 @@
-"""
-Mapping function for converting FHIR MedicationRequest resources to Synthea medications.csv rows.
-"""
+"""FHIR R4 MedicationRequest → Synthea Medication"""
 
-from typing import Any
+import logging
+from datetime import date
+from decimal import Decimal
+
+from fhir.resources.medicationrequest import MedicationRequest
+from synthea_pydantic import Medication as SyntheaMedication
 
 from ..synthea_csv_lib import (
     extract_coding_code,
     extract_display_or_text,
     extract_extension_decimal,
     extract_reference_id,
-    parse_datetime,
+    parse_datetime_to_date,
 )
 
+logger = logging.getLogger(__name__)
 
-def map_fhir_medication_request_to_csv(fhir_resource: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a FHIR R4 MedicationRequest resource to a Synthea medications.csv row.
+
+def convert(src: MedicationRequest) -> SyntheaMedication:
+    """Convert FHIR R4 MedicationRequest to Synthea Medication.
 
     Args:
-        fhir_resource: Dictionary representing a FHIR MedicationRequest resource
+        src: FHIR R4 MedicationRequest resource
 
     Returns:
-        Dictionary with CSV column names as keys (Start, Stop, Patient, etc.)
-    """
+        Synthea Medication model
 
-    # Initialize CSV row
-    csv_row: dict[str, str] = {
-        "Start": "",
-        "Stop": "",
-        "Patient": "",
-        "Encounter": "",
-        "Payer": "",
-        "Code": "",
-        "Description": "",
-        "Dispenses": "",
-        "ReasonCode": "",
-        "ReasonDescription": "",
-        "Base_Cost": "",
-        "Payer_Coverage": "",
-        "TotalCost": "",
-    }
+    Note:
+        Some FHIR fields may not be representable in Synthea format.
+        Check logs for warnings about dropped data.
+    """
+    fhir_resource = src.model_dump(exclude_none=True)
 
     # Extract Start (prefer authoredOn, fallback to occurrencePeriod.start)
+    start = None
     authored_on = fhir_resource.get("authoredOn")
     occurrence_period = fhir_resource.get("occurrencePeriod", {})
 
     if authored_on:
-        csv_row["Start"] = parse_datetime(authored_on)
+        parsed = parse_datetime_to_date(authored_on)
+        if parsed:
+            start = date.fromisoformat(parsed)
     elif occurrence_period.get("start"):
-        csv_row["Start"] = parse_datetime(occurrence_period["start"])
+        parsed = parse_datetime_to_date(occurrence_period["start"])
+        if parsed:
+            start = date.fromisoformat(parsed)
 
     # Extract Stop from occurrencePeriod.end
+    stop = None
     if occurrence_period.get("end"):
-        csv_row["Stop"] = parse_datetime(occurrence_period["end"])
+        parsed = parse_datetime_to_date(occurrence_period["end"])
+        if parsed:
+            stop = date.fromisoformat(parsed)
 
     # Extract Patient reference
+    patient = ""
     subject = fhir_resource.get("subject")
     if subject:
-        csv_row["Patient"] = extract_reference_id(subject)
+        patient = extract_reference_id(subject)
 
     # Extract Encounter reference
-    encounter = fhir_resource.get("encounter")
-    if encounter:
-        csv_row["Encounter"] = extract_reference_id(encounter)
+    encounter = ""
+    encounter_ref = fhir_resource.get("encounter")
+    if encounter_ref:
+        encounter = extract_reference_id(encounter_ref)
 
     # Extract Payer from insurance (Coverage or Organization)
+    payer = ""
     insurance = fhir_resource.get("insurance", [])
     if insurance:
         first_insurance = insurance[0]
-        coverage = first_insurance.get("coverage")
-        if coverage:
-            csv_row["Payer"] = extract_reference_id(coverage)
-
-    # Extract Code and Description from medicationCodeableConcept (RxNorm)
-    medication_code = fhir_resource.get("medicationCodeableConcept")
-    if medication_code:
-        csv_row["Code"] = extract_coding_code(
-            medication_code, "http://www.nlm.nih.gov/research/umls/rxnorm"
+        coverage = (
+            first_insurance.get("coverage")
+            if isinstance(first_insurance, dict)
+            else first_insurance
         )
-        csv_row["Description"] = extract_display_or_text(medication_code)
+        if coverage:
+            payer = extract_reference_id(coverage)
+
+    # Extract Code and Description from medication (R4B uses CodeableReference)
+    code = ""
+    description = ""
+    medication = fhir_resource.get("medication")
+    if medication:
+        # R4B: medication is CodeableReference with concept or reference
+        if "concept" in medication:
+            medication_code = medication["concept"]
+            code = extract_coding_code(
+                medication_code,
+                preferred_system="http://www.nlm.nih.gov/research/umls/rxnorm",
+            )
+            description = extract_display_or_text(medication_code)
+        elif "reference" in medication:
+            # Reference to Medication resource
+            pass
+    else:
+        # R4: medicationCodeableConcept
+        medication_code = fhir_resource.get("medicationCodeableConcept")
+        if medication_code:
+            code = extract_coding_code(
+                medication_code,
+                preferred_system="http://www.nlm.nih.gov/research/umls/rxnorm",
+            )
+            description = extract_display_or_text(medication_code)
 
     # Extract Dispenses
+    dispenses = None
     dispense_request = fhir_resource.get("dispenseRequest", {})
     repeats_allowed = dispense_request.get("numberOfRepeatsAllowed")
     if repeats_allowed is not None:
-        csv_row["Dispenses"] = str(repeats_allowed)
+        dispenses = int(repeats_allowed)
 
     # Extract ReasonCode and ReasonDescription
-    reason_codes = fhir_resource.get("reasonCode", [])
-    if reason_codes:
-        first_reason = reason_codes[0]
-        csv_row["ReasonCode"] = extract_coding_code(
-            first_reason, "http://snomed.info/sct"
-        )
-        csv_row["ReasonDescription"] = extract_display_or_text(first_reason)
+    reason_code = ""
+    reason_description = ""
+
+    # R4B uses reason with CodeableReference
+    reasons = fhir_resource.get("reason", [])
+    if reasons:
+        first_reason = reasons[0]
+        if "concept" in first_reason:
+            concept = first_reason["concept"]
+            reason_code = extract_coding_code(
+                concept, preferred_system="http://snomed.info/sct"
+            )
+            reason_description = extract_display_or_text(concept)
+    else:
+        # R4: reasonCode
+        reason_codes = fhir_resource.get("reasonCode", [])
+        if reason_codes:
+            first_reason = reason_codes[0]
+            reason_code = extract_coding_code(
+                first_reason, preferred_system="http://snomed.info/sct"
+            )
+            reason_description = extract_display_or_text(first_reason)
 
     # Extract financial extensions
-    csv_row["Base_Cost"] = extract_extension_decimal(
+    base_cost_str = extract_extension_decimal(
         fhir_resource, "http://synthea.org/fhir/StructureDefinition/medication-baseCost"
     )
-    csv_row["Payer_Coverage"] = extract_extension_decimal(
+    payer_coverage_str = extract_extension_decimal(
         fhir_resource,
         "http://synthea.org/fhir/StructureDefinition/medication-payerCoverage",
     )
-    csv_row["TotalCost"] = extract_extension_decimal(
+    total_cost_str = extract_extension_decimal(
         fhir_resource,
         "http://synthea.org/fhir/StructureDefinition/medication-totalCost",
     )
 
-    return csv_row
+    base_cost = Decimal(base_cost_str) if base_cost_str else None
+    payer_coverage = Decimal(payer_coverage_str) if payer_coverage_str else None
+    total_cost = Decimal(total_cost_str) if total_cost_str else None
+
+    return SyntheaMedication(
+        start=start,
+        stop=stop,
+        patient=patient or None,
+        payer=payer or None,
+        encounter=encounter or None,
+        code=code or "unknown",
+        description=description or "Unknown medication",
+        base_cost=base_cost,
+        payer_coverage=payer_coverage,
+        dispenses=dispenses,
+        totalcost=total_cost,
+        reasoncode=reason_code or None,
+        reasondescription=reason_description or None,
+    )

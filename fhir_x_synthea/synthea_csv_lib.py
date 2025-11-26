@@ -28,22 +28,26 @@ def extract_reference_id(reference_obj: dict[str, Any] | None) -> str:
     return reference
 
 
-def parse_datetime(dt_str: str | None) -> str:
+def parse_datetime(dt_value: str | datetime | None) -> str:
     """
-    Parse a FHIR datetime string to Synthea format (ISO 8601).
+    Parse a FHIR datetime value to Synthea format (ISO 8601).
 
     Args:
-        dt_str: ISO 8601 datetime string from FHIR
+        dt_value: ISO 8601 datetime string or datetime object from FHIR
 
     Returns:
         ISO 8601 formatted datetime string, or empty string if parsing fails
     """
-    if not dt_str:
+    if not dt_value:
         return ""
     try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        # Handle datetime objects directly
+        if isinstance(dt_value, datetime):
+            return dt_value.isoformat()
+        # Handle string input
+        dt = datetime.fromisoformat(str(dt_value).replace("Z", "+00:00"))
         return dt.isoformat()
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return ""
 
 

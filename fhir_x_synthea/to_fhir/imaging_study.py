@@ -1,77 +1,39 @@
-"""
-Mapping function for converting Synthea imaging_studies.csv rows to FHIR ImagingStudy resources.
-"""
+"""Synthea ImagingStudy → FHIR R4 ImagingStudy"""
 
 from typing import Any
 
+from fhir.resources.imagingstudy import ImagingStudy
+from synthea_pydantic import ImagingStudy as SyntheaImagingStudy
+
 from ..fhir_lib import create_reference, format_datetime
+from ..utils import normalize_sop_code_with_prefix, to_str
 
 
-def map_imaging_study(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea imaging_studies.csv row to a FHIR R4 ImagingStudy resource.
+def convert(src: SyntheaImagingStudy) -> ImagingStudy:
+    """Convert Synthea ImagingStudy to FHIR R4 ImagingStudy.
 
     Args:
-        csv_row: Dictionary with keys like Id, Date, Patient, Encounter,
-                Series UID, Body Site Code, Body Site Description,
-                Modality Code, Modality Description, Instance UID,
-                SOP Code, SOP Description, Procedure Code
+        src: Synthea ImagingStudy model
 
     Returns:
-        Dictionary representing a FHIR ImagingStudy resource
+        FHIR R4 ImagingStudy resource
     """
+    d = src.model_dump()
 
-    # Helper to normalize SOP Code (add urn:oid: prefix if needed)
-    def normalize_sop_code(sop_code: str | None) -> str | None:
-        if not sop_code or sop_code.strip() == "":
-            return None
-        sop_code = sop_code.strip()
-        if sop_code.startswith("urn:oid:"):
-            return sop_code
-        return f"urn:oid:{sop_code}"
-
-    # Extract and process fields
-    study_id = csv_row.get("Id", "").strip() if csv_row.get("Id") else ""
-    date = csv_row.get("Date", "").strip() if csv_row.get("Date") else ""
-    patient_id = csv_row.get("Patient", "").strip() if csv_row.get("Patient") else ""
-    encounter_id = (
-        csv_row.get("Encounter", "").strip() if csv_row.get("Encounter") else ""
-    )
-    series_uid = (
-        csv_row.get("Series UID", "").strip() if csv_row.get("Series UID") else ""
-    )
-    body_site_code = (
-        csv_row.get("Body Site Code", "").strip()
-        if csv_row.get("Body Site Code")
-        else ""
-    )
-    body_site_description = (
-        csv_row.get("Body Site Description", "").strip()
-        if csv_row.get("Body Site Description")
-        else ""
-    )
-    modality_code = (
-        csv_row.get("Modality Code", "").strip() if csv_row.get("Modality Code") else ""
-    )
-    modality_description = (
-        csv_row.get("Modality Description", "").strip()
-        if csv_row.get("Modality Description")
-        else ""
-    )
-    instance_uid = (
-        csv_row.get("Instance UID", "").strip() if csv_row.get("Instance UID") else ""
-    )
-    sop_code = csv_row.get("SOP Code", "").strip() if csv_row.get("SOP Code") else ""
-    sop_description = (
-        csv_row.get("SOP Description", "").strip()
-        if csv_row.get("SOP Description")
-        else ""
-    )
-    procedure_code = (
-        csv_row.get("Procedure Code", "").strip()
-        if csv_row.get("Procedure Code")
-        else ""
-    )
+    # Extract and process fields (synthea_pydantic uses lowercase/snake_case keys)
+    study_id = to_str(d.get("id"))
+    date = to_str(d.get("date"))
+    patient_id = to_str(d.get("patient"))
+    encounter_id = to_str(d.get("encounter"))
+    series_uid = to_str(d.get("series_uid"))
+    body_site_code = to_str(d.get("bodysite_code"))
+    body_site_description = to_str(d.get("bodysite_description"))
+    modality_code = to_str(d.get("modality_code"))
+    modality_description = to_str(d.get("modality_description"))
+    instance_uid = to_str(d.get("instance_uid"))
+    sop_code = to_str(d.get("sop_code"))
+    sop_description = to_str(d.get("sop_description"))
+    procedure_code = to_str(d.get("procedure_code"))
 
     # Generate deterministic resource ID
     date_clean = date.replace(" ", "-").replace(":", "-") if date else ""
@@ -163,7 +125,7 @@ def map_imaging_study(csv_row: dict[str, Any]) -> dict[str, Any]:
 
     # SOP Class
     if sop_code or sop_description:
-        normalized_sop = normalize_sop_code(sop_code)
+        normalized_sop = normalize_sop_code_with_prefix(sop_code)
         sop_class: dict[str, Any] = {}
         if normalized_sop:
             coding = {"system": "urn:ietf:rfc:3986", "code": normalized_sop}
@@ -183,4 +145,4 @@ def map_imaging_study(csv_row: dict[str, Any]) -> dict[str, Any]:
     if series:
         resource["series"] = [series]
 
-    return resource
+    return ImagingStudy(**resource)

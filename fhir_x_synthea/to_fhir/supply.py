@@ -1,101 +1,92 @@
-"""
-Mapping function for converting Synthea supplies.csv rows to FHIR SupplyDelivery resources.
-"""
+"""Synthea Supply → FHIR R4 SupplyDelivery"""
 
 from typing import Any
 
-from ..fhir_lib import create_reference, format_datetime
+from fhir.resources.supplydelivery import SupplyDelivery
+from synthea_pydantic import Supply as SyntheaSupply
+
+from ..fhir_lib import format_datetime
+from ..utils import to_str
 
 
-def map_supply_delivery(csv_row: dict[str, Any]) -> dict[str, Any]:
-    """
-    Map a Synthea supplies.csv row to a FHIR R4 SupplyDelivery resource.
+def convert(
+    src: SyntheaSupply,
+    *,
+    patient_ref: str | None = None,
+) -> SupplyDelivery:
+    """Convert Synthea Supply to FHIR R4 SupplyDelivery.
 
     Args:
-        csv_row: Dictionary with keys like DATE, PATIENT, ENCOUNTER, CODE, DESCRIPTION, QUANTITY
+        src: Synthea Supply model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
 
     Returns:
-        Dictionary representing a FHIR SupplyDelivery resource
+        FHIR R4 SupplyDelivery resource
     """
+    d = src.model_dump()
 
-    # Extract and process fields
-    date = csv_row.get("DATE", "").strip() if csv_row.get("DATE") else ""
-    patient_id = csv_row.get("PATIENT", "").strip() if csv_row.get("PATIENT") else ""
-    encounter_id = (
-        csv_row.get("ENCOUNTER", "").strip() if csv_row.get("ENCOUNTER") else ""
-    )
-    code = csv_row.get("CODE", "").strip() if csv_row.get("CODE") else ""
-    description = (
-        csv_row.get("DESCRIPTION", "").strip() if csv_row.get("DESCRIPTION") else ""
-    )
-    quantity_str = (
-        csv_row.get("QUANTITY", "").strip() if csv_row.get("QUANTITY") else ""
-    )
-
-    # Parse quantity
-    quantity = None
-    if quantity_str:
-        try:
-            quantity = float(quantity_str)
-        except (ValueError, TypeError):
-            pass
+    # Extract fields
+    date = to_str(d.get("date"))
+    patient_id = to_str(d.get("patient"))
+    encounter_id = to_str(d.get("encounter"))
+    code = to_str(d.get("code"))
+    description = to_str(d.get("description"))
+    quantity = d.get("quantity")
 
     # Generate resource ID
     resource_id = f"supply-{patient_id}-{date}-{code}".replace(" ", "-").replace(
         ":", "-"
     )
 
-    # Build base resource
+    # Build resource
     resource: dict[str, Any] = {
         "resourceType": "SupplyDelivery",
         "id": resource_id,
         "status": "completed",
     }
 
-    # Set occurrenceDateTime from DATE
+    # Set occurrence
     if date:
         iso_date = format_datetime(date)
         if iso_date:
             resource["occurrenceDateTime"] = iso_date
 
     # Set patient reference
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["patient"] = patient_ref
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    if effective_patient_ref:
+        resource["patient"] = {"reference": effective_patient_ref}
 
-    # Set encounter reference via extension
+    # Set encounter via extension
     if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource.setdefault("extension", []).append(
-                {
-                    "url": "http://hl7.org/fhir/StructureDefinition/resource-encounter",
-                    "valueReference": encounter_ref,
-                }
-            )
+        resource["extension"] = [
+            {
+                "url": "http://hl7.org/fhir/StructureDefinition/resource-encounter",
+                "valueReference": {"reference": f"Encounter/{encounter_id}"},
+            }
+        ]
 
     # Set suppliedItem
     supplied_item: dict[str, Any] = {}
-
-    # Set itemCodeableConcept
     if code or description:
         item_code: dict[str, Any] = {}
         if code:
-            coding = {"system": "http://snomed.info/sct", "code": code}
-            if description:
-                coding["display"] = description
-            item_code["coding"] = [coding]
+            item_code["coding"] = [
+                {
+                    "system": "http://snomed.info/sct",
+                    "code": code,
+                    "display": description or None,
+                }
+            ]
         if description:
             item_code["text"] = description
-        if item_code:
-            supplied_item["itemCodeableConcept"] = item_code
+        supplied_item["itemCodeableConcept"] = item_code
 
-    # Set quantity
     if quantity is not None:
-        supplied_item["quantity"] = {"value": quantity}
+        supplied_item["quantity"] = {"value": float(quantity)}
 
     if supplied_item:
         resource["suppliedItem"] = supplied_item
 
-    return resource
+    return SupplyDelivery(**resource)

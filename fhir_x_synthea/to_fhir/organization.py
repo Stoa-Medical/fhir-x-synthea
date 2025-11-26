@@ -1,11 +1,89 @@
 """Synthea Organization → FHIR R4 Organization"""
 
-from typing import Any
-
 from fhir.resources.organization import Organization
 from synthea_pydantic import Organization as SyntheaOrganization
 
-from ..utils import split_phones, to_str
+from ..chidian_ext import grab, mapper, to_dict
+from ..utils import split_phones
+
+
+def _geolocation_extension(lat: float | None, lon: float | None):
+    """Create geolocation extension if both lat/lon present."""
+    if lat is None or lon is None:
+        return None
+    return {
+        "url": "http://hl7.org/fhir/StructureDefinition/geolocation",
+        "extension": [
+            {"url": "latitude", "valueDecimal": float(lat)},
+            {"url": "longitude", "valueDecimal": float(lon)},
+        ],
+    }
+
+
+def _address(d: dict):
+    """Build FHIR Address from source dict."""
+    address = grab(d, "address")
+    city = grab(d, "city")
+    state = grab(d, "state")
+    zip_code = grab(d, "zip")
+    lat = grab(d, "lat")
+    lon = grab(d, "lon")
+
+    if not any([address, city, state, zip_code, lat is not None and lon is not None]):
+        return None
+
+    geo = _geolocation_extension(lat, lon)
+    return {
+        "line": [address] if address else None,
+        "city": city,
+        "state": state,
+        "postalCode": zip_code,
+        "extension": [geo] if geo else None,
+    }
+
+
+def _telecom(phone_str: str | None):
+    """Build telecom array from phone string."""
+    phones = split_phones(phone_str)
+    if not phones:
+        return None
+    return [{"system": "phone", "value": phone} for phone in phones]
+
+
+def _stats_extension(d: dict):
+    """Build organization stats extension."""
+    revenue = grab(d, "revenue")
+    utilization = grab(d, "utilization")
+
+    if revenue is None and utilization is None:
+        return None
+
+    nested = []
+    if revenue is not None:
+        nested.append({"url": "revenue", "valueDecimal": float(revenue)})
+    if utilization is not None:
+        nested.append({"url": "utilization", "valueInteger": int(utilization)})
+
+    return {
+        "url": "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
+        "extension": nested,
+    }
+
+
+@mapper
+def _to_fhir_organization(d: dict):
+    """Core mapping from dict to FHIR Organization structure."""
+    addr = _address(d)
+    stats = _stats_extension(d)
+
+    return {
+        "resourceType": "Organization",
+        "id": grab(d, "id"),
+        "name": grab(d, "name"),
+        "address": [addr] if addr else None,
+        "telecom": _telecom(grab(d, "phone")),
+        "extension": [stats] if stats else None,
+    }
 
 
 def convert(src: SyntheaOrganization) -> Organization:
@@ -17,82 +95,4 @@ def convert(src: SyntheaOrganization) -> Organization:
     Returns:
         FHIR R4 Organization resource
     """
-    d = src.model_dump()
-
-    # Extract fields
-    org_id = to_str(d.get("id"))
-    name = to_str(d.get("name"))
-    address = to_str(d.get("address"))
-    city = to_str(d.get("city"))
-    state = to_str(d.get("state"))
-    zip_code = to_str(d.get("zip"))
-    phone_str = to_str(d.get("phone"))
-
-    # Handle numeric fields
-    lat = d.get("lat")
-    lon = d.get("lon")
-    revenue = d.get("revenue")
-    utilization = d.get("utilization")
-
-    # Build resource
-    resource: dict[str, Any] = {"resourceType": "Organization"}
-
-    if org_id:
-        resource["id"] = org_id
-
-    if name:
-        resource["name"] = name
-
-    # Set address
-    if address or city or state or zip_code or (lat is not None and lon is not None):
-        address_obj: dict[str, Any] = {}
-
-        if address:
-            address_obj["line"] = [address]
-        if city:
-            address_obj["city"] = city
-        if state:
-            address_obj["state"] = state
-        if zip_code:
-            address_obj["postalCode"] = zip_code
-
-        if lat is not None and lon is not None:
-            address_obj.setdefault("extension", []).append(
-                {
-                    "url": "http://hl7.org/fhir/StructureDefinition/geolocation",
-                    "extension": [
-                        {"url": "latitude", "valueDecimal": float(lat)},
-                        {"url": "longitude", "valueDecimal": float(lon)},
-                    ],
-                }
-            )
-
-        resource["address"] = [address_obj]
-
-    # Set telecom
-    phones = split_phones(phone_str)
-    if phones:
-        resource["telecom"] = [{"system": "phone", "value": phone} for phone in phones]
-
-    # Set extensions for stats
-    extensions = []
-    if revenue is not None or utilization is not None:
-        stats_ext: dict[str, Any] = {
-            "url": "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
-            "extension": [],
-        }
-        if revenue is not None:
-            stats_ext["extension"].append(
-                {"url": "revenue", "valueDecimal": float(revenue)}
-            )
-        if utilization is not None:
-            stats_ext["extension"].append(
-                {"url": "utilization", "valueInteger": int(utilization)}
-            )
-        if stats_ext["extension"]:
-            extensions.append(stats_ext)
-
-    if extensions:
-        resource["extension"] = extensions
-
-    return Organization(**resource)
+    return Organization(**_to_fhir_organization(to_dict(src)))

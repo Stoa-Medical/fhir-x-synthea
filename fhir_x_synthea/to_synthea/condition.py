@@ -6,14 +6,60 @@ from datetime import date
 from fhir.resources.condition import Condition
 from synthea_pydantic import Condition as SyntheaCondition
 
-from ..synthea_csv_lib import (
-    extract_coding_code,
-    extract_display_or_text,
-    extract_reference_id,
-    parse_datetime_to_date,
+from ..chidian_ext import (
+    extract_code,
+    extract_display,
+    extract_ref_id,
+    grab,
+    mapper,
+    parse_date,
+    to_dict,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@mapper(remove_empty=False)
+def _to_synthea_condition(d: dict):
+    """Core mapping from dict to Synthea Condition structure."""
+    # Parse start from onsetDateTime
+    start = None
+    onset = grab(d, "onsetDateTime")
+    if onset:
+        if isinstance(onset, date):
+            start = onset
+        else:
+            parsed = parse_date({"dt": onset}, "dt")
+            if parsed:
+                start = date.fromisoformat(parsed)
+
+    # Parse stop from abatementDateTime
+    stop = None
+    abatement = grab(d, "abatementDateTime")
+    if abatement:
+        if isinstance(abatement, date):
+            stop = abatement
+        else:
+            parsed = parse_date({"dt": abatement}, "dt")
+            if parsed:
+                stop = date.fromisoformat(parsed)
+
+    # Log lossy conversions
+    categories = grab(d, "category") or []
+    if len(categories) > 1:
+        logger.warning(
+            "Condition has %d categories; Synthea doesn't support categories",
+            len(categories),
+        )
+
+    return {
+        "start": start,
+        "stop": stop,
+        "patient": extract_ref_id(d, "subject") or None,
+        "encounter": extract_ref_id(d, "encounter") or None,
+        "code": extract_code(d, "code", system="http://snomed.info/sct") or "unknown",
+        "description": extract_display(d, "code") or "Unknown condition",
+    }
 
 
 def convert(src: Condition) -> SyntheaCondition:
@@ -24,69 +70,5 @@ def convert(src: Condition) -> SyntheaCondition:
 
     Returns:
         Synthea Condition model
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
     """
-    fhir_resource = src.model_dump(exclude_none=True)
-
-    # Extract START from onsetDateTime
-    start = None
-    onset = fhir_resource.get("onsetDateTime")
-    if onset:
-        if isinstance(onset, date):
-            start = onset
-        else:
-            parsed = parse_datetime_to_date(str(onset))
-            if parsed:
-                start = date.fromisoformat(parsed)
-
-    # Extract STOP from abatementDateTime
-    stop = None
-    abatement = fhir_resource.get("abatementDateTime")
-    if abatement:
-        if isinstance(abatement, date):
-            stop = abatement
-        else:
-            parsed = parse_datetime_to_date(str(abatement))
-            if parsed:
-                stop = date.fromisoformat(parsed)
-
-    # Extract PATIENT reference
-    patient = ""
-    subject = fhir_resource.get("subject")
-    if subject:
-        patient = extract_reference_id(subject)
-
-    # Extract ENCOUNTER reference
-    encounter = ""
-    encounter_ref = fhir_resource.get("encounter")
-    if encounter_ref:
-        encounter = extract_reference_id(encounter_ref)
-
-    # Extract CODE and DESCRIPTION
-    code = ""
-    description = ""
-    code_obj = fhir_resource.get("code")
-    if code_obj:
-        code = extract_coding_code(code_obj, preferred_system="http://snomed.info/sct")
-        description = extract_display_or_text(code_obj)
-
-    # Log lossy conversions
-    categories = fhir_resource.get("category", [])
-    if len(categories) > 1:
-        logger.warning(
-            "Condition %s has %d categories; Synthea doesn't support categories",
-            src.id,
-            len(categories),
-        )
-
-    return SyntheaCondition(
-        start=start,
-        stop=stop,
-        patient=patient or None,
-        encounter=encounter or None,
-        code=code or "unknown",
-        description=description or "Unknown condition",
-    )
+    return SyntheaCondition(**_to_synthea_condition(to_dict(src)))

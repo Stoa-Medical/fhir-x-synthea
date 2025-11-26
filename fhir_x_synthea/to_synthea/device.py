@@ -6,15 +6,99 @@ from datetime import date
 from fhir.resources.device import Device
 from synthea_pydantic import Device as SyntheaDevice
 
-from ..synthea_csv_lib import (
-    extract_coding_code,
-    extract_display_or_text,
-    extract_extension_period,
-    extract_extension_reference,
-    parse_datetime_to_date,
+from ..chidian_ext import (
+    extract_code,
+    extract_display,
+    extract_ext_ref,
+    grab,
+    mapper,
+    parse_date,
+    to_dict,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_period_extension(d: dict):
+    """Extract start and stop from device-use-period extension."""
+    extensions = grab(d, "extension") or []
+    for ext in extensions:
+        if (
+            ext.get("url")
+            == "http://synthea.tools/fhir/StructureDefinition/device-use-period"
+        ):
+            value_period = ext.get("valuePeriod", {})
+            return value_period.get("start"), value_period.get("end")
+    return None, None
+
+
+def _extract_device_type(d: dict) -> tuple[str, str]:
+    """Extract code and description from type (list in R4B, dict in R4)."""
+    device_type = grab(d, "type")
+    if not device_type:
+        return "", ""
+
+    # Handle list (R4B) or single (R4)
+    if isinstance(device_type, list) and device_type:
+        first_type = device_type[0]
+        code = extract_code({"t": first_type}, "t", system="http://snomed.info/sct")
+        desc = extract_display({"t": first_type}, "t")
+        return code, desc
+    elif isinstance(device_type, dict):
+        code = extract_code({"t": device_type}, "t", system="http://snomed.info/sct")
+        desc = extract_display({"t": device_type}, "t")
+        return code, desc
+
+    return "", ""
+
+
+def _extract_udi(d: dict) -> str:
+    """Extract UDI from udiCarrier."""
+    udi_carriers = grab(d, "udiCarrier") or []
+    if udi_carriers:
+        first_udi = udi_carriers[0]
+        return first_udi.get("deviceIdentifier", "") or first_udi.get("carrierHRF", "")
+    return ""
+
+
+@mapper(remove_empty=False)
+def _to_synthea_device(d: dict):
+    """Core mapping from dict to Synthea Device structure."""
+    # Extract period from extension
+    start_str, stop_str = _extract_period_extension(d)
+
+    start = None
+    if start_str:
+        parsed = parse_date({"dt": start_str}, "dt")
+        if parsed:
+            start = date.fromisoformat(parsed)
+
+    stop = None
+    if stop_str:
+        parsed = parse_date({"dt": stop_str}, "dt")
+        if parsed:
+            stop = date.fromisoformat(parsed)
+
+    # Extract patient and encounter from extensions
+    patient = extract_ext_ref(
+        d, "http://hl7.org/fhir/StructureDefinition/resource-patient"
+    )
+    encounter = extract_ext_ref(
+        d, "http://hl7.org/fhir/StructureDefinition/resource-encounter"
+    )
+
+    # Extract type
+    code, description = _extract_device_type(d)
+
+    return {
+        "start": start,
+        "stop": stop,
+        "patient": patient or None,
+        "encounter": encounter or None,
+        "code": code or "unknown",
+        "description": description or "Unknown device",
+        "udi": _extract_udi(d) or None,
+    }
 
 
 def convert(src: Device) -> SyntheaDevice:
@@ -25,80 +109,5 @@ def convert(src: Device) -> SyntheaDevice:
 
     Returns:
         Synthea Device model
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
     """
-    fhir_resource = src.model_dump(exclude_none=True)
-
-    # Extract START and STOP from device-use-period extension
-    start = None
-    stop = None
-    device_period = extract_extension_period(
-        fhir_resource, "http://synthea.tools/fhir/StructureDefinition/device-use-period"
-    )
-
-    if device_period:
-        start_str = device_period.get("start")
-        if start_str:
-            parsed = parse_datetime_to_date(start_str)
-            if parsed:
-                start = date.fromisoformat(parsed)
-
-        stop_str = device_period.get("end")
-        if stop_str:
-            parsed = parse_datetime_to_date(stop_str)
-            if parsed:
-                stop = date.fromisoformat(parsed)
-
-    # Extract PATIENT from extension
-    patient = extract_extension_reference(
-        fhir_resource, "http://hl7.org/fhir/StructureDefinition/resource-patient"
-    )
-
-    # Extract ENCOUNTER from extension
-    encounter = extract_extension_reference(
-        fhir_resource, "http://hl7.org/fhir/StructureDefinition/resource-encounter"
-    )
-
-    # Extract CODE and DESCRIPTION from type
-    # R4B Device.type is a list of CodeableConcept
-    code = ""
-    description = ""
-    device_type = fhir_resource.get("type")
-    if device_type:
-        # Handle list (R4B) or single (R4)
-        if isinstance(device_type, list) and device_type:
-            first_type = device_type[0]
-            code = extract_coding_code(
-                first_type, preferred_system="http://snomed.info/sct"
-            )
-            description = extract_display_or_text(first_type)
-        elif isinstance(device_type, dict):
-            code = extract_coding_code(
-                device_type, preferred_system="http://snomed.info/sct"
-            )
-            description = extract_display_or_text(device_type)
-
-    # Extract UDI (prefer deviceIdentifier, fallback to carrierHRF)
-    udi = ""
-    udi_carriers = fhir_resource.get("udiCarrier", [])
-    if udi_carriers:
-        first_udi = udi_carriers[0]
-        device_identifier = first_udi.get("deviceIdentifier", "")
-        carrier_hrf = first_udi.get("carrierHRF", "")
-        if device_identifier:
-            udi = device_identifier
-        elif carrier_hrf:
-            udi = carrier_hrf
-
-    return SyntheaDevice(
-        start=start,
-        stop=stop,
-        patient=patient or None,
-        encounter=encounter or None,
-        code=code or "unknown",
-        description=description or "Unknown device",
-        udi=udi or None,
-    )
+    return SyntheaDevice(**_to_synthea_device(to_dict(src)))

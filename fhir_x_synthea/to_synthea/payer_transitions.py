@@ -1,26 +1,27 @@
 """FHIR R4 Coverage → Synthea PayerTransition"""
 
 import logging
-from typing import Any
 
 from fhir.resources.coverage import Coverage
 from synthea_pydantic import PayerTransition
 
-from ..synthea_csv_lib import (
-    extract_extension_string,
-    extract_reference_id,
-    extract_year,
+from ..chidian_ext import (
+    extract_ext,
+    extract_ext_ref,
+    extract_ref_id,
+    grab,
+    mapper,
+    to_dict,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _map_relationship(relationship_obj: dict[str, Any] | None) -> str:
+def _map_relationship(relationship_obj: dict | None) -> str:
     """Map FHIR relationship to Synthea ownership."""
     if not relationship_obj:
         return ""
 
-    # Check codings first
     codings = relationship_obj.get("coding", [])
     for coding in codings:
         code = coding.get("code", "")
@@ -33,12 +34,95 @@ def _map_relationship(relationship_obj: dict[str, Any] | None) -> str:
         elif code == "parent":
             return "Guardian"
 
-    # Check text (for Guardian)
     text = relationship_obj.get("text", "")
     if text == "Guardian":
         return "Guardian"
 
     return ""
+
+
+def _extract_year(date_str: str | None) -> int | None:
+    """Extract year from date string."""
+    if not date_str:
+        return None
+    try:
+        # Handle YYYY-MM-DD format
+        if len(date_str) >= 4:
+            return int(date_str[:4])
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _extract_secondary_payer(d: dict) -> str:
+    """Extract secondary payer from payor list or extension."""
+    # Check payor list (R4)
+    payors = grab(d, "payor") or []
+    if len(payors) > 1:
+        ref = payors[1].get("reference", "") if isinstance(payors[1], dict) else ""
+        if "/" in ref:
+            return ref.split("/")[-1]
+        return ref
+
+    # Check extension
+    return extract_ext_ref(
+        d, "http://synthea.mitre.org/fhir/StructureDefinition/secondary-payer"
+    )
+
+
+@mapper(remove_empty=False)
+def _to_synthea_payer_transition(d: dict):
+    """Core mapping from dict to Synthea PayerTransition structure."""
+    # Extract patient
+    patient = extract_ref_id(d, "beneficiary")
+
+    # Extract member ID (prefer subscriberId, fallback to identifier)
+    member_id = grab(d, "subscriberId") or ""
+    if not member_id:
+        identifiers = grab(d, "identifier") or []
+        if identifiers:
+            member_id = identifiers[0].get("value", "")
+
+    # Extract period years
+    period = grab(d, "period") or {}
+    start_year = _extract_year(period.get("start"))
+    end_year = _extract_year(period.get("end"))
+
+    # Extract payer (R4B uses insurer, R4 uses payor)
+    payer = extract_ref_id(d, "insurer")
+    if not payer:
+        payors = grab(d, "payor") or []
+        if payors:
+            ref = payors[0].get("reference", "") if isinstance(payors[0], dict) else ""
+            if "/" in ref:
+                payer = ref.split("/")[-1]
+            else:
+                payer = ref
+
+    # Extract secondary payer
+    secondary_payer = _extract_secondary_payer(d)
+
+    # Extract ownership
+    ownership = _map_relationship(grab(d, "relationship"))
+
+    # Extract owner name
+    owner_name = extract_ext(
+        d,
+        "http://synthea.mitre.org/fhir/StructureDefinition/owner-name",
+        "valueString",
+        "",
+    )
+
+    return {
+        "patient": patient or None,
+        "memberid": member_id or None,
+        "start_year": start_year,
+        "end_year": end_year,
+        "payer": payer or None,
+        "secondary_payer": secondary_payer or None,
+        "ownership": ownership or None,
+        "owner_name": owner_name or None,
+    }
 
 
 def convert(src: Coverage) -> PayerTransition:
@@ -49,97 +133,5 @@ def convert(src: Coverage) -> PayerTransition:
 
     Returns:
         Synthea PayerTransition model
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
     """
-    fhir_resource = src.model_dump(exclude_none=True)
-
-    # Extract Patient reference
-    patient = ""
-    beneficiary = fhir_resource.get("beneficiary")
-    if beneficiary:
-        patient = extract_reference_id(beneficiary)
-
-    # Extract Member ID (prefer subscriberId, fallback to identifier)
-    member_id = fhir_resource.get("subscriberId", "")
-    if not member_id:
-        identifiers = fhir_resource.get("identifier", [])
-        if identifiers:
-            member_id = identifiers[0].get("value", "")
-
-    # Extract Start_Year and End_Year from period
-    start_year = None
-    end_year = None
-    period = fhir_resource.get("period", {})
-    start = period.get("start")
-    if start:
-        year_str = extract_year(start)
-        if year_str:
-            start_year = int(year_str)
-
-    end = period.get("end")
-    if end:
-        year_str = extract_year(end)
-        if year_str:
-            end_year = int(year_str)
-
-    # Extract Payer references (R4B uses insurer, R4 uses payor)
-    payer = ""
-    secondary_payer = ""
-
-    # Try insurer first (R4B)
-    insurer = fhir_resource.get("insurer")
-    if insurer:
-        payer = extract_reference_id(insurer)
-    else:
-        # Fallback to payor (R4)
-        payors = fhir_resource.get("payor", [])
-        if len(payors) > 0:
-            payer = extract_reference_id(payors[0])
-
-        if len(payors) > 1:
-            secondary_payer = extract_reference_id(payors[1])
-
-    # Check for secondary payer in extension
-    if not secondary_payer:
-        secondary_payer = extract_extension_string(
-            fhir_resource,
-            "http://synthea.mitre.org/fhir/StructureDefinition/secondary-payer",
-        )
-        if not secondary_payer:
-            # Try valueReference
-            extensions = fhir_resource.get("extension", [])
-            for ext in extensions:
-                if (
-                    ext.get("url")
-                    == "http://synthea.mitre.org/fhir/StructureDefinition/secondary-payer"
-                ):
-                    value_ref = ext.get("valueReference")
-                    if value_ref:
-                        secondary_payer = extract_reference_id(value_ref)
-                        break
-
-    # Extract Ownership (relationship)
-    ownership = ""
-    relationship = fhir_resource.get("relationship")
-    if relationship:
-        ownership = _map_relationship(relationship)
-
-    # Extract Owner Name from extension
-    owner_name = extract_extension_string(
-        fhir_resource,
-        "http://synthea.mitre.org/fhir/StructureDefinition/owner-name",
-    )
-
-    return PayerTransition(
-        patient=patient or None,
-        memberid=member_id or None,
-        start_year=start_year,
-        end_year=end_year,
-        payer=payer or None,
-        secondary_payer=secondary_payer or None,
-        ownership=ownership or None,
-        owner_name=owner_name or None,
-    )
+    return PayerTransition(**_to_synthea_payer_transition(to_dict(src)))

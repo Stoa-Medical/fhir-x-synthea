@@ -1,57 +1,115 @@
 """Synthea PayerTransition → FHIR R4 Coverage"""
 
-from typing import Any
-
 from fhir.resources.coverage import Coverage
 from synthea_pydantic import PayerTransition as SyntheaPayerTransition
 
-from ..utils import to_str
+from ..chidian_ext import grab, mapper, to_dict
 
 
-def _map_relationship(ownership: str | None) -> dict[str, Any] | None:
+def _resource_id(d: dict) -> str:
+    """Generate deterministic resource ID."""
+    patient_id = grab(d, "patient") or ""
+    payer_id = grab(d, "payer") or ""
+    start_year = grab(d, "start_year") or ""
+    return f"{patient_id}-{payer_id}-{start_year}".replace(" ", "-")
+
+
+def _map_relationship(ownership: str | None):
     """Map ownership to FHIR relationship CodeableConcept."""
     if not ownership:
         return None
-    ownership_lower = ownership.lower().strip()
-    relationship_map = {
-        "self": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
-                    "code": "self",
-                    "display": "Self",
-                }
-            ]
-        },
-        "spouse": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
-                    "code": "spouse",
-                    "display": "Spouse",
-                }
-            ]
-        },
-        "child": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
-                    "code": "child",
-                    "display": "Child",
-                }
-            ]
-        },
-        "guardian": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
-                    "code": "parent",
-                    "display": "Parent",
-                }
-            ]
-        },
+    mapping = {
+        "self": ("self", "Self"),
+        "spouse": ("spouse", "Spouse"),
+        "child": ("child", "Child"),
+        "guardian": ("parent", "Parent"),
     }
-    return relationship_map.get(ownership_lower)
+    entry = mapping.get(ownership.lower().strip())
+    if not entry:
+        return None
+    code, display = entry
+    return {
+        "coding": [
+            {
+                "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
+                "code": code,
+                "display": display,
+            }
+        ]
+    }
+
+
+def _coverage_period(start_year, end_year):
+    """Build coverage period."""
+    if start_year is None and end_year is None:
+        return None
+    result = {}
+    if start_year is not None:
+        result["start"] = f"{start_year}-01-01"
+    if end_year is not None:
+        result["end"] = f"{end_year}-12-31"
+    return result if result else None
+
+
+def _secondary_payer_extension(secondary_payer_id: str | None):
+    """Build secondary payer extension."""
+    if not secondary_payer_id:
+        return None
+    return {
+        "url": "http://synthea.mitre.org/fhir/StructureDefinition/secondary-payer",
+        "valueReference": {"reference": f"Organization/{secondary_payer_id}"},
+    }
+
+
+def _owner_name_extension(owner_name: str | None):
+    """Build owner name extension."""
+    if not owner_name:
+        return None
+    return {
+        "url": "http://synthea.mitre.org/fhir/StructureDefinition/owner-name",
+        "valueString": owner_name,
+    }
+
+
+@mapper
+def _to_fhir_coverage(d: dict, patient_ref: str | None = None):
+    """Core mapping from dict to FHIR Coverage structure."""
+    patient_id = grab(d, "patient")
+    end_year = grab(d, "end_year")
+
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+
+    # Build extensions list
+    extensions = [
+        e
+        for e in [
+            _secondary_payer_extension(grab(d, "secondary_payer")),
+            _owner_name_extension(grab(d, "owner_name")),
+        ]
+        if e
+    ]
+
+    payer_id = grab(d, "payer")
+
+    return {
+        "resourceType": "Coverage",
+        "id": _resource_id(d),
+        "status": "cancelled" if end_year is not None else "active",
+        "kind": "insurance",
+        "beneficiary": {"reference": effective_patient_ref}
+        if effective_patient_ref
+        else None,
+        "subscriber": {"reference": effective_patient_ref}
+        if effective_patient_ref
+        else None,
+        "subscriberId": grab(d, "memberid"),
+        "relationship": _map_relationship(grab(d, "ownership")),
+        "period": _coverage_period(grab(d, "start_year"), end_year),
+        "insurer": {"reference": f"Organization/{payer_id}"} if payer_id else None,
+        "extension": extensions if extensions else None,
+    }
 
 
 def convert(
@@ -68,86 +126,4 @@ def convert(
     Returns:
         FHIR R4 Coverage resource
     """
-    d = src.model_dump()
-
-    # Extract fields
-    patient_id = to_str(d.get("patient"))
-    member_id = to_str(d.get("memberid"))
-    start_year = d.get("start_year")
-    end_year = d.get("end_year")
-    payer_id = to_str(d.get("payer"))
-    secondary_payer_id = to_str(d.get("secondary_payer"))
-    ownership = to_str(d.get("ownership"))
-    owner_name = to_str(d.get("owner_name"))
-
-    # Determine status
-    status = "active" if end_year is None else "cancelled"
-
-    # Generate resource ID
-    resource_id = f"{patient_id}-{payer_id}-{start_year}".replace(" ", "-")
-
-    # Build resource
-    resource: dict[str, Any] = {
-        "resourceType": "Coverage",
-        "status": status,
-        "kind": "insurance",
-    }
-
-    if resource_id:
-        resource["id"] = resource_id
-
-    # Set beneficiary
-    effective_patient_ref = patient_ref or (
-        f"Patient/{patient_id}" if patient_id else None
-    )
-    if effective_patient_ref:
-        resource["beneficiary"] = {"reference": effective_patient_ref}
-
-    # Set subscriber (same as beneficiary for self)
-    if effective_patient_ref:
-        resource["subscriber"] = {"reference": effective_patient_ref}
-
-    # Set subscriberId
-    if member_id:
-        resource["subscriberId"] = member_id
-
-    # Set relationship
-    relationship = _map_relationship(ownership)
-    if relationship:
-        resource["relationship"] = relationship
-
-    # Set period
-    if start_year is not None or end_year is not None:
-        period: dict[str, Any] = {}
-        if start_year is not None:
-            period["start"] = f"{start_year}-01-01"
-        if end_year is not None:
-            period["end"] = f"{end_year}-12-31"
-        if period:
-            resource["period"] = period
-
-    # Set insurer (payer)
-    if payer_id:
-        resource["insurer"] = {"reference": f"Organization/{payer_id}"}
-
-    # Set extensions for secondary payer and owner
-    extensions = []
-    if secondary_payer_id:
-        extensions.append(
-            {
-                "url": "http://synthea.mitre.org/fhir/StructureDefinition/secondary-payer",
-                "valueReference": {"reference": f"Organization/{secondary_payer_id}"},
-            }
-        )
-    if owner_name:
-        extensions.append(
-            {
-                "url": "http://synthea.mitre.org/fhir/StructureDefinition/owner-name",
-                "valueString": owner_name,
-            }
-        )
-
-    if extensions:
-        resource["extension"] = extensions
-
-    return Coverage(**resource)
+    return Coverage(**_to_fhir_coverage(to_dict(src), patient_ref))

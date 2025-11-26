@@ -1,17 +1,102 @@
 """Synthea Allergy → FHIR R4 AllergyIntolerance"""
 
-from typing import Any
-
 from fhir.resources.allergyintolerance import AllergyIntolerance
 from synthea_pydantic import Allergy
 
+from ..chidian_ext import grab, mapper, to_dict
 from ..fhir_lib import (
-    create_clinical_status_coding,
-    create_reference,
+    clinical_status,
+    codeable_concept,
     format_datetime,
     normalize_allergy_category,
+    ref,
+    verification_status,
 )
-from ..utils import to_str
+
+
+def _allergy_id(d: dict) -> str:
+    """Generate deterministic allergy ID from patient+start+code."""
+    patient_id = grab(d, "patient") or ""
+    start = grab(d, "start") or ""
+    code = grab(d, "code") or ""
+    return f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
+
+
+def _allergy_type(type_str: str | None):
+    """Build allergy type CodeableConcept."""
+    if not type_str:
+        return None
+    type_code = type_str.lower()
+    return {
+        "coding": [
+            {
+                "system": "http://hl7.org/fhir/allergy-intolerance-type",
+                "code": type_code,
+                "display": type_code.capitalize(),
+            }
+        ]
+    }
+
+
+def _reaction(code: str | None, desc: str | None, severity: str | None) -> dict | None:
+    """Build a single reaction entry."""
+    if not code and not desc:
+        return None
+
+    result: dict = {}
+    if code:
+        result["manifestation"] = [
+            {
+                "concept": {
+                    "coding": [{"system": "http://snomed.info/sct", "code": code}]
+                }
+            }
+        ]
+    if desc:
+        result["description"] = desc
+    if severity:
+        result["severity"] = severity.lower()
+
+    return result if result else None
+
+
+@mapper
+def _to_fhir_allergy(d: dict):
+    """Core mapping from dict to FHIR AllergyIntolerance structure."""
+    stop = grab(d, "stop")
+    category = normalize_allergy_category(grab(d, "category"))
+
+    # Build reactions list
+    r1 = _reaction(grab(d, "reaction1"), grab(d, "description1"), grab(d, "severity1"))
+    r2 = _reaction(grab(d, "reaction2"), grab(d, "description2"), grab(d, "severity2"))
+    reactions = [r for r in [r1, r2] if r is not None]
+
+    return {
+        "resourceType": "AllergyIntolerance",
+        "id": _allergy_id(d),
+        "clinicalStatus": clinical_status(
+            is_active=not stop,
+            system="http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+        ),
+        "verificationStatus": verification_status(
+            code="confirmed",
+            system="http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
+        ),
+        "type": _allergy_type(grab(d, "type")),
+        "category": [category] if category else None,
+        "code": codeable_concept(
+            system=grab(d, "system"),
+            code=grab(d, "code"),
+            display=grab(d, "description"),
+            text=grab(d, "description"),
+        ),
+        "patient": ref("Patient", grab(d, "patient")),
+        "encounter": ref("Encounter", grab(d, "encounter")),
+        "recordedDate": grab(d, "start", apply=format_datetime),
+        "onsetDateTime": grab(d, "start", apply=format_datetime),
+        "lastOccurrence": grab(d, "stop", apply=format_datetime),
+        "reaction": reactions if reactions else None,
+    }
 
 
 def convert(src: Allergy) -> AllergyIntolerance:
@@ -23,158 +108,4 @@ def convert(src: Allergy) -> AllergyIntolerance:
     Returns:
         FHIR R4 AllergyIntolerance resource
     """
-    d = src.model_dump()
-
-    # Extract and process fields (synthea_pydantic uses lowercase keys)
-    start = to_str(d.get("start"))
-    stop = to_str(d.get("stop"))
-    patient_id = to_str(d.get("patient"))
-    encounter_id = to_str(d.get("encounter"))
-    code = to_str(d.get("code"))
-    system = to_str(d.get("system"))
-    description = to_str(d.get("description"))
-    allergy_type = to_str(d.get("type"))
-    category = to_str(d.get("category"))
-
-    # Reactions
-    reaction1_code = to_str(d.get("reaction1"))
-    reaction1_desc = to_str(d.get("description1"))
-    reaction1_severity = to_str(d.get("severity1"))
-    reaction2_code = to_str(d.get("reaction2"))
-    reaction2_desc = to_str(d.get("description2"))
-    reaction2_severity = to_str(d.get("severity2"))
-
-    # Determine clinical status based on stop field
-    is_active = not stop
-    clinical_status = create_clinical_status_coding(
-        is_active, "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical"
-    )
-
-    # Generate resource ID from patient+start+code
-    resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
-
-    # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "AllergyIntolerance",
-        "id": resource_id,
-        "clinicalStatus": clinical_status,
-        "verificationStatus": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
-                    "code": "confirmed",
-                    "display": "Confirmed",
-                }
-            ]
-        },
-    }
-
-    # Set recordedDate and onsetDateTime from start
-    if start:
-        iso_start = format_datetime(start)
-        if iso_start:
-            resource["recordedDate"] = iso_start
-            resource["onsetDateTime"] = iso_start
-
-    # Set lastOccurrence from stop if present
-    if stop:
-        iso_stop = format_datetime(stop)
-        if iso_stop:
-            resource["lastOccurrence"] = iso_stop
-
-    # Set patient reference (required)
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["patient"] = patient_ref
-
-    # Set encounter reference (optional)
-    if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource["encounter"] = encounter_ref
-
-    # Set code (substance/product)
-    if code or system or description:
-        code_obj: dict[str, Any] = {}
-        if code or system:
-            coding: dict[str, str] = {}
-            if code:
-                coding["code"] = code
-            if system:
-                coding["system"] = system
-            if description:
-                coding["display"] = description
-            if coding:
-                code_obj["coding"] = [coding]
-        if description:
-            code_obj["text"] = description
-        if code_obj:
-            resource["code"] = code_obj
-
-    # Set type (allergy vs intolerance) - R4B uses CodeableConcept
-    if allergy_type:
-        type_code = allergy_type.lower()
-        resource["type"] = {
-            "coding": [
-                {
-                    "system": "http://hl7.org/fhir/allergy-intolerance-type",
-                    "code": type_code,
-                    "display": type_code.capitalize(),
-                }
-            ]
-        }
-
-    # Set category (normalized)
-    normalized_category = normalize_allergy_category(category)
-    if normalized_category:
-        resource["category"] = [normalized_category]
-
-    # Build reactions array (R4B uses CodeableReference for manifestation)
-    reactions = []
-
-    # First reaction
-    if reaction1_code or reaction1_desc:
-        reaction1: dict[str, Any] = {}
-        if reaction1_code:
-            # R4B: manifestation is List[CodeableReference], not List[CodeableConcept]
-            reaction1["manifestation"] = [
-                {
-                    "concept": {
-                        "coding": [
-                            {"system": "http://snomed.info/sct", "code": reaction1_code}
-                        ]
-                    }
-                }
-            ]
-        if reaction1_desc:
-            reaction1["description"] = reaction1_desc
-        if reaction1_severity:
-            reaction1["severity"] = reaction1_severity.lower()
-        if reaction1:
-            reactions.append(reaction1)
-
-    # Second reaction (optional)
-    if reaction2_code or reaction2_desc:
-        reaction2: dict[str, Any] = {}
-        if reaction2_code:
-            reaction2["manifestation"] = [
-                {
-                    "concept": {
-                        "coding": [
-                            {"system": "http://snomed.info/sct", "code": reaction2_code}
-                        ]
-                    }
-                }
-            ]
-        if reaction2_desc:
-            reaction2["description"] = reaction2_desc
-        if reaction2_severity:
-            reaction2["severity"] = reaction2_severity.lower()
-        if reaction2:
-            reactions.append(reaction2)
-
-    if reactions:
-        resource["reaction"] = reactions
-
-    return AllergyIntolerance(**resource)
+    return AllergyIntolerance(**_to_fhir_allergy(to_dict(src)))

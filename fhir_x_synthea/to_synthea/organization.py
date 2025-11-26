@@ -2,39 +2,84 @@
 
 import logging
 from decimal import Decimal
-from typing import Any
 
 from fhir.resources.organization import Organization
 from synthea_pydantic import Organization as SyntheaOrganization
 
-from ..synthea_csv_lib import extract_nested_extension
+from ..chidian_ext import extract_nested_ext, grab, mapper, to_dict
+from ..synthea_lib import to_decimal
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_geolocation(
-    address: dict[str, Any] | None,
-) -> tuple[Decimal | None, Decimal | None]:
+def _extract_geolocation(address: dict | None) -> tuple[Decimal | None, Decimal | None]:
     """Extract lat/lon from address extension."""
     if not address:
-        return (None, None)
+        return None, None
 
     extensions = address.get("extension", [])
     for ext in extensions:
         if ext.get("url") == "http://hl7.org/fhir/StructureDefinition/geolocation":
-            sub_extensions = ext.get("extension", [])
-            lat = None
-            lon = None
-            for sub_ext in sub_extensions:
-                url = sub_ext.get("url", "")
+            lat, lon = None, None
+            for sub_ext in ext.get("extension", []):
                 value = sub_ext.get("valueDecimal")
                 if value is not None:
-                    if url == "latitude":
+                    if sub_ext.get("url") == "latitude":
                         lat = Decimal(str(value))
-                    elif url == "longitude":
+                    elif sub_ext.get("url") == "longitude":
                         lon = Decimal(str(value))
-            return (lat, lon)
-    return (None, None)
+            return lat, lon
+    return None, None
+
+
+def _extract_phones(d: dict) -> str:
+    """Extract phone numbers and join with semicolon."""
+    telecoms = grab(d, "telecom") or []
+    phones = [
+        contact.get("value", "")
+        for contact in telecoms
+        if contact.get("system") == "phone" and contact.get("value")
+    ]
+    return "; ".join(phones)
+
+
+@mapper(remove_empty=False)
+def _to_synthea_organization(d: dict):
+    """Core mapping from dict to Synthea Organization structure."""
+    addresses = grab(d, "address") or []
+    first_address = addresses[0] if addresses else {}
+
+    lines = first_address.get("line", [])
+    address = lines[0] if lines else ""
+
+    lat, lon = _extract_geolocation(first_address)
+
+    # Extract stats from extension
+    stats_url = "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats"
+    revenue_str = extract_nested_ext(d, stats_url, "revenue", "valueDecimal", "")
+    utilization_str = extract_nested_ext(
+        d, stats_url, "utilization", "valueInteger", ""
+    )
+
+    # Log lossy conversions
+    if len(addresses) > 1:
+        logger.warning(
+            "Organization has %d addresses; only first preserved", len(addresses)
+        )
+
+    return {
+        "id": grab(d, "id") or None,
+        "name": grab(d, "name") or "Unknown Organization",
+        "address": address or None,
+        "city": first_address.get("city") or None,
+        "state": first_address.get("state") or None,
+        "zip": first_address.get("postalCode") or None,
+        "lat": lat,
+        "lon": lon,
+        "phone": _extract_phones(d) or None,
+        "revenue": to_decimal(revenue_str) if revenue_str else None,
+        "utilization": int(utilization_str) if utilization_str else None,
+    }
 
 
 def convert(src: Organization) -> SyntheaOrganization:
@@ -45,89 +90,5 @@ def convert(src: Organization) -> SyntheaOrganization:
 
     Returns:
         Synthea Organization model
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
     """
-    fhir_resource = src.model_dump(exclude_none=True)
-
-    # Extract Id
-    resource_id = fhir_resource.get("id", "")
-
-    # Extract Name
-    name = fhir_resource.get("name", "")
-
-    # Extract Address components
-    address = ""
-    city = ""
-    state = ""
-    zip_code = ""
-    lat = None
-    lon = None
-
-    addresses = fhir_resource.get("address", [])
-    if addresses:
-        first_address = addresses[0]
-
-        # Address line
-        lines = first_address.get("line", [])
-        if lines:
-            address = lines[0]
-
-        city = first_address.get("city", "")
-        state = first_address.get("state", "")
-        zip_code = first_address.get("postalCode", "")
-
-        # Geolocation
-        lat, lon = _extract_geolocation(first_address)
-
-    # Extract Phone numbers (join with ; )
-    telecom = fhir_resource.get("telecom", [])
-    phones = []
-    for contact in telecom:
-        if contact.get("system") == "phone":
-            value = contact.get("value", "")
-            if value:
-                phones.append(value)
-
-    phone = "; ".join(phones) if phones else ""
-
-    # Extract organization stats extensions
-    revenue_str = extract_nested_extension(
-        fhir_resource,
-        "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
-        "revenue",
-        "valueDecimal",
-    )
-    utilization_str = extract_nested_extension(
-        fhir_resource,
-        "http://synthea.mitre.org/fhir/StructureDefinition/organization-stats",
-        "utilization",
-        "valueInteger",
-    )
-
-    revenue = Decimal(revenue_str) if revenue_str else None
-    utilization = int(utilization_str) if utilization_str else None
-
-    # Log lossy conversions
-    if len(addresses) > 1:
-        logger.warning(
-            "Organization %s has %d addresses; only first preserved",
-            src.id,
-            len(addresses),
-        )
-
-    return SyntheaOrganization(
-        id=resource_id or None,
-        name=name or "Unknown Organization",
-        address=address or None,
-        city=city or None,
-        state=state or None,
-        zip=zip_code or None,
-        lat=lat,
-        lon=lon,
-        phone=phone or None,
-        revenue=revenue,
-        utilization=utilization,
-    )
+    return SyntheaOrganization(**_to_synthea_organization(to_dict(src)))

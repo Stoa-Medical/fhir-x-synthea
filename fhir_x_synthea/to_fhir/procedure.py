@@ -1,12 +1,101 @@
 """Synthea Procedure → FHIR R4 Procedure"""
 
-from typing import Any
-
 from fhir.resources.procedure import Procedure
 from synthea_pydantic import Procedure as SyntheaProcedure
 
-from ..fhir_lib import format_datetime
-from ..utils import to_str
+from ..chidian_ext import grab, mapper, to_dict
+from ..fhir_lib import codeable_concept, format_datetime, ref
+
+
+def _procedure_id(d: dict) -> str:
+    """Generate deterministic procedure ID."""
+    patient_id = grab(d, "patient") or ""
+    start = grab(d, "start") or ""
+    code = grab(d, "code") or ""
+    return f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
+
+
+def _occurrence(start: str | None, stop: str | None):
+    """Build occurrence (period or datetime)."""
+    iso_start = format_datetime(start) if start else None
+    iso_stop = format_datetime(stop) if stop else None
+
+    if iso_start and iso_stop:
+        return {"period": {"start": iso_start, "end": iso_stop}}
+    elif iso_start:
+        return {"datetime": iso_start}
+    return None
+
+
+def _reason(reason_code: str | None, reason_desc: str | None) -> list | None:
+    """Build procedure reason (CodeableReference)."""
+    if not reason_code and not reason_desc:
+        return None
+
+    concept: dict = {}
+    if reason_code:
+        coding = {"system": "http://snomed.info/sct", "code": reason_code}
+        if reason_desc:
+            coding["display"] = reason_desc
+        concept["coding"] = [coding]
+    if reason_desc:
+        concept["text"] = reason_desc
+
+    return [{"concept": concept}] if concept else None
+
+
+@mapper
+def _to_fhir_procedure(
+    d: dict,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+):
+    """Core mapping from dict to FHIR Procedure structure."""
+    patient_id = grab(d, "patient")
+    encounter_id = grab(d, "encounter")
+    start = grab(d, "start")
+    stop = grab(d, "stop")
+    base_cost = grab(d, "base_cost")
+
+    # Build effective references
+    eff_patient_ref = patient_ref or (f"Patient/{patient_id}" if patient_id else None)
+    eff_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+
+    # Build occurrence
+    occ = _occurrence(start, stop)
+
+    return {
+        "resourceType": "Procedure",
+        "id": _procedure_id(d),
+        "status": "completed",
+        "code": codeable_concept(
+            system="http://snomed.info/sct",
+            code=grab(d, "code"),
+            display=grab(d, "description"),
+            text=grab(d, "description"),
+        ),
+        "subject": ref(
+            "Patient", eff_patient_ref.split("/")[-1] if eff_patient_ref else None
+        ),
+        "encounter": ref(
+            "Encounter", eff_encounter_ref.split("/")[-1] if eff_encounter_ref else None
+        ),
+        "occurrencePeriod": occ.get("period") if occ and "period" in occ else None,
+        "occurrenceDateTime": occ.get("datetime")
+        if occ and "datetime" in occ
+        else None,
+        "reason": _reason(grab(d, "reasoncode"), grab(d, "reasondescription")),
+        "extension": [
+            {
+                "url": "http://example.org/fhir/StructureDefinition/baseCost",
+                "valueMoney": {"value": float(base_cost), "currency": "USD"},
+            }
+        ]
+        if base_cost is not None
+        else None,
+    }
 
 
 def convert(
@@ -25,93 +114,4 @@ def convert(
     Returns:
         FHIR R4 Procedure resource
     """
-    d = src.model_dump()
-
-    # Extract fields
-    start = to_str(d.get("start"))
-    stop = to_str(d.get("stop"))
-    patient_id = to_str(d.get("patient"))
-    encounter_id = to_str(d.get("encounter"))
-    code = to_str(d.get("code"))
-    description = to_str(d.get("description"))
-    base_cost = d.get("base_cost")
-    reason_code = to_str(d.get("reasoncode"))
-    reason_description = to_str(d.get("reasondescription"))
-
-    # Generate resource ID
-    resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
-
-    # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "Procedure",
-        "id": resource_id,
-        "status": "completed",
-    }
-
-    # Set performed period or datetime
-    if start:
-        iso_start = format_datetime(start)
-        if iso_start:
-            if stop:
-                iso_stop = format_datetime(stop)
-                if iso_stop:
-                    resource["occurrencePeriod"] = {"start": iso_start, "end": iso_stop}
-                else:
-                    resource["occurrenceDateTime"] = iso_start
-            else:
-                resource["occurrenceDateTime"] = iso_start
-
-    # Set subject reference
-    effective_patient_ref = patient_ref or (
-        f"Patient/{patient_id}" if patient_id else None
-    )
-    if effective_patient_ref:
-        resource["subject"] = {"reference": effective_patient_ref}
-
-    # Set encounter reference
-    effective_encounter_ref = encounter_ref or (
-        f"Encounter/{encounter_id}" if encounter_id else None
-    )
-    if effective_encounter_ref:
-        resource["encounter"] = {"reference": effective_encounter_ref}
-
-    # Set code
-    if code or description:
-        code_obj: dict[str, Any] = {}
-        if code:
-            code_obj["coding"] = [
-                {
-                    "system": "http://snomed.info/sct",
-                    "code": code,
-                    "display": description or None,
-                }
-            ]
-        if description:
-            code_obj["text"] = description
-        resource["code"] = code_obj
-
-    # Set reason (R4B uses reason with CodeableReference)
-    if reason_code or reason_description:
-        concept: dict[str, Any] = {}
-        if reason_code:
-            concept["coding"] = [
-                {
-                    "system": "http://snomed.info/sct",
-                    "code": reason_code,
-                    "display": reason_description or None,
-                }
-            ]
-        if reason_description:
-            concept["text"] = reason_description
-        resource["reason"] = [{"concept": concept}]
-
-    # Set cost extension
-    if base_cost is not None:
-        resource["extension"] = [
-            {
-                "url": "http://example.org/fhir/StructureDefinition/baseCost",
-                "valueMoney": {"value": float(base_cost), "currency": "USD"},
-            }
-        ]
-
-    return Procedure(**resource)
+    return Procedure(**_to_fhir_procedure(to_dict(src), patient_ref, encounter_ref))

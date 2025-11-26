@@ -1,6 +1,9 @@
 """
 Common helper functions for FHIR mapping operations.
 Shared utilities used across fhir_mappers modules.
+
+Includes chidian-compatible helpers that return DROP.THIS_OBJECT
+when inputs are empty, for use with @mapper decorators.
 """
 
 from datetime import datetime
@@ -257,3 +260,256 @@ def split_name(name_str: str | None) -> tuple[str | None, str | None]:
     if len(tokens) == 1:
         return tokens[0], None
     return tokens[0], tokens[-1]
+
+
+# =============================================================================
+# Chidian-compatible builders
+# These return None when inputs are empty, integrating with @mapper's
+# remove_empty=True behavior which strips None values from output.
+# =============================================================================
+
+
+def ref(resource_type: str, resource_id: str | None) -> dict[str, str] | None:
+    """
+    Create a FHIR reference, or None if id is empty.
+
+    For use with chidian @mapper - returns None when id is missing,
+    which @mapper(remove_empty=True) will strip from output.
+
+    Args:
+        resource_type: FHIR resource type (e.g., "Patient", "Encounter")
+        resource_id: Resource identifier
+
+    Returns:
+        {"reference": "Type/id"} or None
+    """
+    if not resource_id or (isinstance(resource_id, str) and not resource_id.strip()):
+        return None
+    rid = resource_id.strip() if isinstance(resource_id, str) else str(resource_id)
+    return {"reference": f"{resource_type}/{rid}"}
+
+
+def coding(
+    system: str | None,
+    code: str | None,
+    display: str | None = None,
+) -> dict[str, str] | None:
+    """
+    Create a FHIR Coding, or None if code is empty.
+
+    Args:
+        system: Code system URL
+        code: The code value
+        display: Optional display text
+
+    Returns:
+        Coding dict or None
+    """
+    if not code or (isinstance(code, str) and not code.strip()):
+        return None
+
+    result: dict[str, str] = {}
+    if system:
+        result["system"] = system
+    result["code"] = code.strip() if isinstance(code, str) else str(code)
+    if display:
+        result["display"] = display
+    return result
+
+
+def codeable_concept(
+    system: str | None,
+    code: str | None,
+    display: str | None = None,
+    text: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Create a FHIR CodeableConcept, or None if code is empty.
+
+    Args:
+        system: Code system URL
+        code: The code value
+        display: Optional display text for coding
+        text: Optional text field
+
+    Returns:
+        CodeableConcept dict or None
+    """
+    c = coding(system, code, display)
+    if c is None:
+        # If no code but we have text, still create concept
+        if text:
+            return {"text": text}
+        return None
+
+    result: dict[str, Any] = {"coding": [c]}
+    if text:
+        result["text"] = text
+    return result
+
+
+def identifier(
+    system: str | None,
+    value: str | None,
+    type_system: str | None = None,
+    type_code: str | None = None,
+    type_display: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Create a FHIR Identifier, or None if value is empty.
+
+    Args:
+        system: Identifier system URL
+        value: Identifier value
+        type_system: Optional type coding system
+        type_code: Optional type code
+        type_display: Optional type display
+
+    Returns:
+        Identifier dict or None
+    """
+    if not value or (isinstance(value, str) and not value.strip()):
+        return None
+
+    result: dict[str, Any] = {
+        "value": value.strip() if isinstance(value, str) else str(value)
+    }
+
+    if system:
+        result["system"] = system
+
+    if type_code:
+        type_coding = coding(type_system, type_code, type_display)
+        if type_coding is not None:
+            result["type"] = {"coding": [type_coding]}
+
+    return result
+
+
+def period(start: str | None, end: str | None = None) -> dict[str, str] | None:
+    """
+    Create a FHIR Period, or None if both start and end are empty.
+
+    Args:
+        start: Start datetime (ISO 8601)
+        end: End datetime (ISO 8601)
+
+    Returns:
+        Period dict or None
+    """
+    result: dict[str, str] = {}
+    if start:
+        result["start"] = start
+    if end:
+        result["end"] = end
+    if not result:
+        return None
+    return result
+
+
+def extension(
+    url: str, value: Any, value_type: str = "valueString"
+) -> dict[str, Any] | None:
+    """
+    Create a FHIR Extension, or None if value is empty.
+
+    Args:
+        url: Extension URL
+        value: Extension value
+        value_type: FHIR value type key (e.g., "valueString", "valueDecimal")
+
+    Returns:
+        Extension dict or None
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return {"url": url, value_type: value}
+
+
+def quantity(
+    value: float | int | None,
+    unit: str | None = None,
+    system: str | None = None,
+    code: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Create a FHIR Quantity, or None if value is None.
+
+    Args:
+        value: Numeric value
+        unit: Unit display string
+        system: Unit system URL
+        code: Unit code
+
+    Returns:
+        Quantity dict or None
+    """
+    if value is None:
+        return None
+
+    result: dict[str, Any] = {"value": value}
+    if unit:
+        result["unit"] = unit
+    if system:
+        result["system"] = system
+    if code:
+        result["code"] = code
+    return result
+
+
+def clinical_status(
+    is_active: bool,
+    system: str = "http://terminology.hl7.org/CodeSystem/condition-clinical",
+    active_code: str = "active",
+    resolved_code: str = "resolved",
+) -> dict[str, Any]:
+    """
+    Create a FHIR clinical status CodeableConcept.
+
+    Unlike other helpers, this always returns a value (never DROP)
+    since clinical status is typically required.
+
+    Args:
+        is_active: Whether the condition is active
+        system: CodeSystem URL
+        active_code: Code for active status
+        resolved_code: Code for resolved status
+
+    Returns:
+        CodeableConcept for clinical status
+    """
+    code = active_code if is_active else resolved_code
+    return {
+        "coding": [
+            {
+                "system": system,
+                "code": code,
+                "display": code.capitalize(),
+            }
+        ]
+    }
+
+
+def verification_status(
+    code: str = "confirmed",
+    system: str = "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+) -> dict[str, Any]:
+    """
+    Create a FHIR verification status CodeableConcept.
+
+    Args:
+        code: Verification status code
+        system: CodeSystem URL
+
+    Returns:
+        CodeableConcept for verification status
+    """
+    return {
+        "coding": [
+            {
+                "system": system,
+                "code": code,
+                "display": code.capitalize(),
+            }
+        ]
+    }

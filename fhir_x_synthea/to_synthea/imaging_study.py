@@ -6,15 +6,46 @@ from datetime import datetime
 from fhir.resources.imagingstudy import ImagingStudy
 from synthea_pydantic import ImagingStudy as SyntheaImagingStudy
 
-from ..synthea_csv_lib import (
-    extract_coding_code,
-    extract_display_or_text,
-    extract_reference_id,
-    normalize_sop_code,
-    parse_datetime,
-)
+from ..chidian_ext import extract_code, extract_display, extract_ref_id, grab, to_dict
+from ..synthea_csv_lib import normalize_sop_code
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_modality(modality: dict | None) -> tuple[str, str]:
+    """Extract modality code and description."""
+    if not modality:
+        return "", ""
+
+    codings = modality.get("coding", [])
+    # Prefer DICOM-DCM system
+    for coding in codings:
+        if "dicom.nema.org" in coding.get("system", ""):
+            return coding.get("code", ""), coding.get("display", "")
+
+    # Fallback to first coding
+    if codings:
+        return codings[0].get("code", ""), codings[0].get("display", "")
+
+    return "", ""
+
+
+def _extract_sop_class(sop_class: dict | None) -> tuple[str, str]:
+    """Extract SOP class code and description."""
+    if not sop_class:
+        return "", ""
+
+    codings = sop_class.get("coding", [])
+    if codings:
+        raw_code = codings[0].get("code", "")
+        return normalize_sop_code(raw_code), codings[0].get("display", "")
+
+    # Try text field
+    text = sop_class.get("text", "")
+    if text:
+        return normalize_sop_code(text), ""
+
+    return "", ""
 
 
 def convert(src: ImagingStudy) -> list[SyntheaImagingStudy]:
@@ -27,77 +58,55 @@ def convert(src: ImagingStudy) -> list[SyntheaImagingStudy]:
 
     Returns:
         List of Synthea ImagingStudy models
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
     """
-    fhir_resource = src.model_dump(exclude_none=True)
+    d = to_dict(src)
     results = []
 
     # Extract common fields
-    identifiers = fhir_resource.get("identifier", [])
-    study_id = ""
-    if identifiers:
-        study_id = identifiers[0].get("value", "")
+    identifiers = grab(d, "identifier") or []
+    study_id = identifiers[0].get("value", "") if identifiers else ""
 
-    started = fhir_resource.get("started", "")
-    date_str = parse_datetime(started) if started else None
+    # Parse started datetime
+    started = grab(d, "started")
     study_date = None
-    if date_str:
+    if started:
         try:
-            study_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            dt_str = str(started).replace("Z", "+00:00")
+            study_date = datetime.fromisoformat(dt_str)
         except ValueError:
             pass
 
-    subject = fhir_resource.get("subject")
-    patient_id = extract_reference_id(subject) if subject else ""
+    patient_id = extract_ref_id(d, "subject")
+    encounter_id = extract_ref_id(d, "encounter")
 
-    encounter = fhir_resource.get("encounter")
-    encounter_id = extract_reference_id(encounter) if encounter else ""
-
-    # Extract Procedure Code
-    procedure_codes = fhir_resource.get("procedureCode", [])
+    # Extract procedure code
+    procedure_codes = grab(d, "procedureCode") or []
     procedure_code = ""
     if procedure_codes:
-        first_procedure = procedure_codes[0]
-        procedure_code = extract_coding_code(
-            first_procedure, preferred_system="http://snomed.info/sct"
+        procedure_code = extract_code(
+            {"p": procedure_codes[0]}, "p", system="http://snomed.info/sct"
         )
 
     # Generate rows for each series-instance pair
-    series_list = fhir_resource.get("series", [])
+    series_list = grab(d, "series") or []
 
     for series in series_list:
         series_uid = series.get("uid", "")
 
         # Extract body site
         body_site = series.get("bodySite")
-        body_site_code = ""
-        body_site_description = ""
-        if body_site:
-            body_site_code = extract_coding_code(
-                body_site, preferred_system="http://snomed.info/sct"
-            )
-            body_site_description = extract_display_or_text(body_site)
+        body_site_code = (
+            extract_code({"b": body_site}, "b", system="http://snomed.info/sct")
+            if body_site
+            else ""
+        )
+        body_site_description = (
+            extract_display({"b": body_site}, "b") if body_site else ""
+        )
 
         # Extract modality
         modality = series.get("modality")
-        modality_code = ""
-        modality_description = ""
-        if modality:
-            codings = modality.get("coding", [])
-            if codings:
-                # Prefer DICOM-DCM system
-                for coding in codings:
-                    if "dicom.nema.org" in coding.get("system", ""):
-                        modality_code = coding.get("code", "")
-                        modality_description = coding.get("display", "")
-                        break
-                # Fallback to first coding
-                if not modality_code and codings:
-                    modality_code = codings[0].get("code", "")
-                    modality_description = codings[0].get("display", "")
+        modality_code, modality_description = _extract_modality(modality)
 
         # Extract instances
         instances = series.get("instance", [])
@@ -124,24 +133,10 @@ def convert(src: ImagingStudy) -> list[SyntheaImagingStudy]:
             results.append(imaging)
         else:
             # Create one row per instance
-            for idx, instance in enumerate(instances):
+            for instance in instances:
                 instance_uid = instance.get("uid", "")
-
-                # Extract SOP Class
                 sop_class = instance.get("sopClass")
-                sop_code = ""
-                sop_description = ""
-                if sop_class:
-                    codings = sop_class.get("coding", [])
-                    if codings:
-                        sop_code_raw = codings[0].get("code", "")
-                        sop_code = normalize_sop_code(sop_code_raw)
-                        sop_description = codings[0].get("display", "")
-                    else:
-                        # If no coding, try text
-                        sop_code_raw = sop_class.get("text", "")
-                        sop_code = normalize_sop_code(sop_code_raw)
-
+                sop_code, sop_description = _extract_sop_class(sop_class)
                 instance_number = instance.get("number")
 
                 imaging = SyntheaImagingStudy(

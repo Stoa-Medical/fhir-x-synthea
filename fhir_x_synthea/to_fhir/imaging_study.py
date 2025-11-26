@@ -1,12 +1,156 @@
 """Synthea ImagingStudy → FHIR R4 ImagingStudy"""
 
-from typing import Any
-
 from fhir.resources.imagingstudy import ImagingStudy
 from synthea_pydantic import ImagingStudy as SyntheaImagingStudy
 
-from ..fhir_lib import create_reference, format_datetime
-from ..utils import normalize_sop_code_with_prefix, to_str
+from ..chidian_ext import grab, mapper, to_dict
+from ..fhir_lib import format_datetime, identifier, ref
+from ..utils import normalize_sop_code_with_prefix
+
+
+def _resource_id(d: dict) -> str:
+    """Generate deterministic resource ID."""
+    patient_id = grab(d, "patient") or ""
+    date = (grab(d, "date") or "").replace(" ", "-").replace(":", "-")
+    series_uid = grab(d, "series_uid") or ""
+    instance_uid = grab(d, "instance_uid") or ""
+    return f"imaging-{patient_id}-{date}-{series_uid}-{instance_uid}".replace(" ", "-")
+
+
+def _body_site(code: str | None, description: str | None) -> dict | None:
+    """Build body site CodeableConcept."""
+    if not code and not description:
+        return None
+    result: dict = {}
+    if code:
+        coding = {"system": "http://snomed.info/sct", "code": code}
+        if description:
+            coding["display"] = description
+        result["coding"] = [coding]
+    if description:
+        result["text"] = description
+    return result if result else None
+
+
+def _modality(code: str | None, description: str | None) -> dict | None:
+    """Build modality Coding."""
+    if not code and not description:
+        return None
+    result: dict = {}
+    if code:
+        coding = {
+            "system": "http://dicom.nema.org/resources/ontology/DCM",
+            "code": code,
+        }
+        if description:
+            coding["display"] = description
+        result["coding"] = [coding]
+    if description:
+        result["text"] = description
+    return result if result else None
+
+
+def _sop_class(code: str | None, description: str | None) -> dict | None:
+    """Build SOP class Coding."""
+    normalized_code = normalize_sop_code_with_prefix(code)
+    if not normalized_code and not description:
+        return None
+    result: dict = {}
+    if normalized_code:
+        coding = {"system": "urn:ietf:rfc:3986", "code": normalized_code}
+        if description:
+            coding["display"] = description
+        result["coding"] = [coding]
+    if description:
+        result["text"] = description
+    return result if result else None
+
+
+def _build_instance(d: dict):
+    """Build instance structure."""
+    instance_uid = grab(d, "instance_uid")
+    sop_code = grab(d, "sop_code")
+    sop_description = grab(d, "sop_description")
+
+    if not instance_uid and not sop_code and not sop_description:
+        return None
+
+    result = {}
+    if instance_uid:
+        result["uid"] = instance_uid
+
+    sop = _sop_class(sop_code, sop_description)
+    if sop:
+        result["sopClass"] = sop
+
+    return result if result else None
+
+
+def _build_series(d: dict):
+    """Build series structure."""
+    series_uid = grab(d, "series_uid")
+    body_site_code = grab(d, "bodysite_code")
+    body_site_description = grab(d, "bodysite_description")
+    modality_code = grab(d, "modality_code")
+    modality_description = grab(d, "modality_description")
+
+    instance = _build_instance(d)
+
+    if not any(
+        [
+            series_uid,
+            body_site_code,
+            body_site_description,
+            modality_code,
+            modality_description,
+            instance,
+        ]
+    ):
+        return None
+
+    result = {}
+    if series_uid:
+        result["uid"] = series_uid
+
+    body_site = _body_site(body_site_code, body_site_description)
+    if body_site:
+        result["bodySite"] = body_site
+
+    modality = _modality(modality_code, modality_description)
+    if modality:
+        result["modality"] = modality
+
+    if instance:
+        result["instance"] = [instance]
+
+    return [result] if result else None
+
+
+def _procedure_code(code: str | None):
+    """Build procedureCode CodeableConcept."""
+    if not code:
+        return None
+    return [{"coding": [{"system": "http://snomed.info/sct", "code": code}]}]
+
+
+@mapper
+def _to_fhir_imaging_study(d: dict):
+    """Core mapping from dict to FHIR ImagingStudy structure."""
+    study_id = grab(d, "id")
+
+    return {
+        "resourceType": "ImagingStudy",
+        "id": _resource_id(d),
+        "status": "available",
+        "identifier": [identifier(system="urn:synthea:imaging_studies", value=study_id)]
+        if study_id
+        else None,
+        "started": grab(d, "date", apply=format_datetime),
+        "subject": ref("Patient", grab(d, "patient")),
+        "encounter": ref("Encounter", grab(d, "encounter")),
+        "procedureCode": _procedure_code(grab(d, "procedure_code")),
+        "series": _build_series(d),
+    }
 
 
 def convert(src: SyntheaImagingStudy) -> ImagingStudy:
@@ -18,131 +162,4 @@ def convert(src: SyntheaImagingStudy) -> ImagingStudy:
     Returns:
         FHIR R4 ImagingStudy resource
     """
-    d = src.model_dump()
-
-    # Extract and process fields (synthea_pydantic uses lowercase/snake_case keys)
-    study_id = to_str(d.get("id"))
-    date = to_str(d.get("date"))
-    patient_id = to_str(d.get("patient"))
-    encounter_id = to_str(d.get("encounter"))
-    series_uid = to_str(d.get("series_uid"))
-    body_site_code = to_str(d.get("bodysite_code"))
-    body_site_description = to_str(d.get("bodysite_description"))
-    modality_code = to_str(d.get("modality_code"))
-    modality_description = to_str(d.get("modality_description"))
-    instance_uid = to_str(d.get("instance_uid"))
-    sop_code = to_str(d.get("sop_code"))
-    sop_description = to_str(d.get("sop_description"))
-    procedure_code = to_str(d.get("procedure_code"))
-
-    # Generate deterministic resource ID
-    date_clean = date.replace(" ", "-").replace(":", "-") if date else ""
-    resource_id = (
-        f"imaging-{patient_id}-{date_clean}-{series_uid}-{instance_uid}".replace(
-            " ", "-"
-        )
-    )
-
-    # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "ImagingStudy",
-        "id": resource_id,
-        "status": "available",
-    }
-
-    # Set identifier (business identifier)
-    if study_id:
-        resource["identifier"] = [
-            {"system": "urn:synthea:imaging_studies", "value": study_id}
-        ]
-
-    # Set started datetime
-    if date:
-        iso_date = format_datetime(date)
-        if iso_date:
-            resource["started"] = iso_date
-
-    # Set subject (patient) reference
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["subject"] = patient_ref
-
-    # Set encounter reference
-    if encounter_id:
-        encounter_ref = create_reference("Encounter", encounter_id)
-        if encounter_ref:
-            resource["encounter"] = encounter_ref
-
-    # Set procedureCode (SNOMED CT)
-    if procedure_code:
-        resource["procedureCode"] = [
-            {"coding": [{"system": "http://snomed.info/sct", "code": procedure_code}]}
-        ]
-
-    # Build series structure
-    series: dict[str, Any] = {}
-
-    # Series UID
-    if series_uid:
-        series["uid"] = series_uid
-
-    # Body site (SNOMED CT)
-    if body_site_code or body_site_description:
-        body_site: dict[str, Any] = {}
-        if body_site_code:
-            coding = {"system": "http://snomed.info/sct", "code": body_site_code}
-            if body_site_description:
-                coding["display"] = body_site_description
-            body_site["coding"] = [coding]
-        if body_site_description:
-            body_site["text"] = body_site_description
-        if body_site:
-            series["bodySite"] = body_site
-
-    # Modality (DICOM)
-    if modality_code or modality_description:
-        modality: dict[str, Any] = {}
-        if modality_code:
-            coding = {
-                "system": "http://dicom.nema.org/resources/ontology/DCM",
-                "code": modality_code,
-            }
-            if modality_description:
-                coding["display"] = modality_description
-            modality["coding"] = [coding]
-        if modality_description:
-            modality["text"] = modality_description
-        if modality:
-            series["modality"] = modality
-
-    # Build instance structure
-    instance: dict[str, Any] = {}
-
-    # Instance UID
-    if instance_uid:
-        instance["uid"] = instance_uid
-
-    # SOP Class
-    if sop_code or sop_description:
-        normalized_sop = normalize_sop_code_with_prefix(sop_code)
-        sop_class: dict[str, Any] = {}
-        if normalized_sop:
-            coding = {"system": "urn:ietf:rfc:3986", "code": normalized_sop}
-            if sop_description:
-                coding["display"] = sop_description
-            sop_class["coding"] = [coding]
-        if sop_description:
-            sop_class["text"] = sop_description
-        if sop_class:
-            instance["sopClass"] = sop_class
-
-    # Add instance to series if instance has content
-    if instance:
-        series["instance"] = [instance]
-
-    # Add series to resource if series has content
-    if series:
-        resource["series"] = [series]
-
-    return ImagingStudy(**resource)
+    return ImagingStudy(**_to_fhir_imaging_study(to_dict(src)))

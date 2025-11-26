@@ -1,12 +1,85 @@
 """Synthea CarePlan → FHIR R4 CarePlan"""
 
-from typing import Any
-
 from fhir.resources.careplan import CarePlan
 from synthea_pydantic import CarePlan as SyntheaCarePlan
 
-from ..fhir_lib import format_datetime
-from ..utils import to_str
+from ..chidian_ext import grab, mapper, to_dict
+from ..fhir_lib import format_datetime, period, ref
+
+
+def _careplan_id(d: dict) -> str:
+    """Generate deterministic careplan ID."""
+    careplan_id = grab(d, "id")
+    if careplan_id:
+        return careplan_id
+    patient_id = grab(d, "patient") or ""
+    start = grab(d, "start") or ""
+    code = grab(d, "code") or ""
+    return f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
+
+
+def _addresses(reason_code: str | None, reason_desc: str | None) -> list | None:
+    """Build CarePlan addresses (reason) structure."""
+    if not reason_code and not reason_desc:
+        return None
+
+    concept: dict = {}
+    if reason_code:
+        coding = {"system": "http://snomed.info/sct", "code": reason_code}
+        if reason_desc:
+            coding["display"] = reason_desc
+        concept["coding"] = [coding]
+    if reason_desc:
+        concept["text"] = reason_desc
+
+    return [{"concept": concept}] if concept else None
+
+
+@mapper
+def _to_fhir_careplan(
+    d: dict,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+):
+    """Core mapping from dict to FHIR CarePlan structure."""
+    patient_id = grab(d, "patient")
+    encounter_id = grab(d, "encounter")
+    start = grab(d, "start")
+    stop = grab(d, "stop")
+    code = grab(d, "code")
+    description = grab(d, "description")
+
+    # Build effective references
+    eff_patient_ref = patient_ref or (f"Patient/{patient_id}" if patient_id else None)
+    eff_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+
+    # Build period
+    care_period = period(
+        format_datetime(start) if start else None,
+        format_datetime(stop) if stop else None,
+    )
+
+    return {
+        "resourceType": "CarePlan",
+        "id": _careplan_id(d),
+        "status": "completed" if stop else "active",
+        "intent": "plan",
+        "title": description,
+        "description": description,
+        "category": [{"coding": [{"system": "http://snomed.info/sct", "code": code}]}]
+        if code
+        else None,
+        "subject": ref(
+            "Patient", eff_patient_ref.split("/")[-1] if eff_patient_ref else None
+        ),
+        "encounter": ref(
+            "Encounter", eff_encounter_ref.split("/")[-1] if eff_encounter_ref else None
+        ),
+        "period": care_period,
+        "addresses": _addresses(grab(d, "reasoncode"), grab(d, "reasondescription")),
+    }
 
 
 def convert(
@@ -25,85 +98,4 @@ def convert(
     Returns:
         FHIR R4 CarePlan resource
     """
-    d = src.model_dump()
-
-    # Extract fields
-    careplan_id = to_str(d.get("id"))
-    start = to_str(d.get("start"))
-    stop = to_str(d.get("stop"))
-    patient_id = to_str(d.get("patient"))
-    encounter_id = to_str(d.get("encounter"))
-    code = to_str(d.get("code"))
-    description = to_str(d.get("description"))
-    reason_code = to_str(d.get("reasoncode"))
-    reason_description = to_str(d.get("reasondescription"))
-
-    # Determine status
-    status = "active" if not stop else "completed"
-
-    # Generate resource ID
-    resource_id = careplan_id or f"{patient_id}-{start}-{code}".replace(
-        " ", "-"
-    ).replace(":", "-")
-
-    # Build resource
-    resource: dict[str, Any] = {
-        "resourceType": "CarePlan",
-        "status": status,
-        "intent": "plan",
-    }
-
-    if resource_id:
-        resource["id"] = resource_id
-
-    # Set period
-    period: dict[str, Any] = {}
-    if start:
-        iso_start = format_datetime(start)
-        if iso_start:
-            period["start"] = iso_start
-    if stop:
-        iso_stop = format_datetime(stop)
-        if iso_stop:
-            period["end"] = iso_stop
-    if period:
-        resource["period"] = period
-
-    # Set subject reference
-    effective_patient_ref = patient_ref or (
-        f"Patient/{patient_id}" if patient_id else None
-    )
-    if effective_patient_ref:
-        resource["subject"] = {"reference": effective_patient_ref}
-
-    # Set encounter reference
-    effective_encounter_ref = encounter_ref or (
-        f"Encounter/{encounter_id}" if encounter_id else None
-    )
-    if effective_encounter_ref:
-        resource["encounter"] = {"reference": effective_encounter_ref}
-
-    # Set category
-    if code:
-        resource["category"] = [
-            {"coding": [{"system": "http://snomed.info/sct", "code": code}]}
-        ]
-
-    # Set description and title
-    if description:
-        resource["description"] = description
-        resource["title"] = description
-
-    # Set addresses (reason) - R4B uses addresses instead of reasonCode
-    if reason_code or reason_description:
-        addresses_obj: dict[str, Any] = {}
-        if reason_code:
-            coding = {"system": "http://snomed.info/sct", "code": reason_code}
-            if reason_description:
-                coding["display"] = reason_description
-            addresses_obj["coding"] = [coding]
-        if reason_description:
-            addresses_obj["text"] = reason_description
-        resource["addresses"] = [{"concept": addresses_obj}]
-
-    return CarePlan(**resource)
+    return CarePlan(**_to_fhir_careplan(to_dict(src), patient_ref, encounter_ref))

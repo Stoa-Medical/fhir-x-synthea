@@ -1,62 +1,159 @@
 """Synthea ClaimTransaction → FHIR R4 Claim and ClaimResponse"""
 
-from typing import Any
-
 from fhir.resources.claim import Claim
 from fhir.resources.claimresponse import ClaimResponse
 from synthea_pydantic import ClaimTransaction
 
-from ..fhir_lib import create_reference, format_datetime
-from ..utils import to_str
+from ..chidian_ext import grab, mapper, to_dict
+from ..fhir_lib import format_datetime, ref
 
 
-def convert(src: ClaimTransaction) -> Claim:
-    """Convert Synthea ClaimTransaction to FHIR R4 Claim.
+def _build_billable_period(from_date: str | None, to_date: str | None):
+    """Build billablePeriod."""
+    result = {}
+    if from_date:
+        iso_from = format_datetime(from_date)
+        if iso_from:
+            result["start"] = iso_from
+    if to_date:
+        iso_to = format_datetime(to_date)
+        if iso_to:
+            result["end"] = iso_to
+    return result if result else None
 
-    Args:
-        src: Synthea ClaimTransaction model
 
-    Returns:
-        FHIR R4 Claim resource (skeleton based on transaction data)
-    """
-    d = src.model_dump()
+def _build_care_team(supervising_provider_id: str | None):
+    """Build careTeam."""
+    if not supervising_provider_id:
+        return None
+    provider_ref = ref("Practitioner", supervising_provider_id)
+    if not provider_ref:
+        return None
+    return [
+        {
+            "sequence": 1,
+            "provider": provider_ref,
+            "role": {"text": "supervising"},
+        }
+    ]
 
-    # Extract and process fields (synthea_pydantic uses lowercase keys)
-    claim_id = to_str(d.get("claimid"))
-    transaction_id = to_str(d.get("id"))
-    patient_id = to_str(d.get("patientid"))
-    place_of_service_id = to_str(d.get("placeofservice"))
-    provider_id = to_str(d.get("providerid"))
-    from_date = to_str(d.get("fromdate"))
-    to_date = to_str(d.get("todate"))
-    appointment_id = to_str(d.get("appointmentid"))
-    procedure_code = to_str(d.get("procedurecode"))
-    notes = to_str(d.get("notes"))
-    line_note = to_str(d.get("linenote"))
-    supervising_provider_id = to_str(d.get("supervisingproviderid"))
-    patient_insurance_id = to_str(d.get("patientinsuranceid"))
-    department_id = to_str(d.get("departmentid"))
-    fee_schedule_id = to_str(d.get("feescheduleid"))
 
-    # Parse numeric fields
-    charge_id = d.get("chargeid")
-    units = d.get("units")
-    unit_amount = d.get("unitamount")
-    amount = d.get("amount")
-
-    # Extract diagnosis references (diagnosisref1-4)
-    diagnosis_sequences = []
+def _build_diagnosis_sequences(d: dict):
+    """Build diagnosis sequence list."""
+    sequences = []
     for i in range(1, 5):
-        diag_ref = d.get(f"diagnosisref{i}")
+        diag_ref = grab(d, f"diagnosisref{i}")
         if diag_ref is not None:
             try:
-                diagnosis_sequences.append(int(diag_ref))
+                sequences.append(int(diag_ref))
             except (ValueError, TypeError):
                 pass
+    return sequences if sequences else None
 
-    # Build base resource
-    resource: dict[str, Any] = {
+
+def _build_claim_item(d: dict) -> list:
+    """Build claim item structure."""
+    item: dict = {"sequence": 1}
+
+    charge_id = grab(d, "chargeid")
+    if charge_id is not None:
+        try:
+            item["sequence"] = int(charge_id)
+        except (ValueError, TypeError):
+            pass
+
+    # Encounter reference
+    appointment_id = grab(d, "appointmentid")
+    if appointment_id:
+        encounter_ref = ref("Encounter", appointment_id)
+        if encounter_ref:
+            item["encounter"] = [encounter_ref]
+
+    # Product or service
+    procedure_code = grab(d, "procedurecode")
+    line_note = grab(d, "linenote")
+    if procedure_code:
+        coding = {"system": "http://snomed.info/sct", "code": str(procedure_code)}
+        if line_note:
+            coding["display"] = line_note
+        item["productOrService"] = {"coding": [coding]}
+    else:
+        item["productOrService"] = {"text": "Service"}
+
+    # Quantity
+    units = grab(d, "units")
+    if units is not None:
+        item["quantity"] = {"value": float(units)}
+
+    # Unit price
+    unit_amount = grab(d, "unitamount")
+    if unit_amount is not None:
+        item["unitPrice"] = {"value": float(unit_amount), "currency": "USD"}
+
+    # Net amount
+    amount = grab(d, "amount")
+    if amount is not None:
+        item["net"] = {"value": float(amount), "currency": "USD"}
+
+    # Diagnosis sequence
+    diag_seq = _build_diagnosis_sequences(d)
+    if diag_seq:
+        item["diagnosisSequence"] = diag_seq
+
+    # Notes on item
+    item_notes = []
+    department_id = grab(d, "departmentid")
+    if department_id:
+        item_notes.append({"text": f"Department ID: {department_id}"})
+    fee_schedule_id = grab(d, "feescheduleid")
+    if fee_schedule_id:
+        item_notes.append({"text": f"Fee Schedule ID: {fee_schedule_id}"})
+    if item_notes:
+        item["note"] = item_notes
+
+    # Transaction ID extension on item
+    transaction_id = grab(d, "id")
+    if transaction_id:
+        item["extension"] = [
+            {
+                "url": "http://synthea.tools/StructureDefinition/transaction-id",
+                "valueString": str(transaction_id),
+            }
+        ]
+
+    return [item]
+
+
+def _build_claim_notes(d: dict):
+    """Build claim notes."""
+    notes = []
+    main_notes = grab(d, "notes")
+    if main_notes:
+        notes.append({"text": str(main_notes)})
+
+    line_note = grab(d, "linenote")
+    procedure_code = grab(d, "procedurecode")
+    if line_note and not procedure_code:  # Only add if not already used as display
+        notes.append({"text": str(line_note)})
+
+    return notes if notes else None
+
+
+@mapper
+def _to_fhir_claim_transaction(d: dict):
+    """Core mapping from dict to FHIR Claim structure (from transaction)."""
+    claim_id = grab(d, "claimid")
+    patient_insurance_id = grab(d, "patientinsuranceid")
+
+    insurance = None
+    if patient_insurance_id:
+        insurance_ref = ref("Coverage", patient_insurance_id)
+        if insurance_ref:
+            insurance = [{"sequence": 1, "focal": True, "coverage": insurance_ref}]
+
+    return {
         "resourceType": "Claim",
+        "id": claim_id,
         "status": "active",
         "use": "claim",
         "type": {
@@ -75,164 +172,167 @@ def convert(src: ClaimTransaction) -> Claim:
                 }
             ]
         },
+        "patient": ref("Patient", grab(d, "patientid")),
+        "provider": ref("Practitioner", grab(d, "providerid")),
+        "facility": ref("Organization", grab(d, "placeofservice")),
+        "billablePeriod": _build_billable_period(
+            grab(d, "fromdate"), grab(d, "todate")
+        ),
+        "insurance": insurance,
+        "careTeam": _build_care_team(grab(d, "supervisingproviderid")),
+        "item": _build_claim_item(d),
+        "note": _build_claim_notes(d),
     }
 
-    if claim_id:
-        resource["id"] = claim_id
 
-    # Set patient reference
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["patient"] = patient_ref
-
-    # Set provider reference
-    if provider_id:
-        provider_ref = create_reference("Practitioner", provider_id)
-        if provider_ref:
-            resource["provider"] = provider_ref
-
-    # Set facility
-    if place_of_service_id:
-        facility_ref = create_reference("Organization", place_of_service_id)
-        if facility_ref:
-            resource["facility"] = facility_ref
-
-    # Set billablePeriod
-    billable_period: dict[str, Any] = {}
-    if from_date:
-        iso_from = format_datetime(from_date)
-        if iso_from:
-            billable_period["start"] = iso_from
-    if to_date:
-        iso_to = format_datetime(to_date)
-        if iso_to:
-            billable_period["end"] = iso_to
-    if billable_period:
-        resource["billablePeriod"] = billable_period
-
-    # Set insurance
-    if patient_insurance_id:
-        insurance_ref = create_reference("Coverage", patient_insurance_id)
-        if insurance_ref:
-            resource["insurance"] = [
-                {"sequence": 1, "focal": True, "coverage": insurance_ref}
-            ]
-
-    # Set careTeam (supervising provider)
-    if supervising_provider_id:
-        provider_ref = create_reference("Practitioner", supervising_provider_id)
-        if provider_ref:
-            resource["careTeam"] = [
-                {
-                    "sequence": 1,
-                    "provider": provider_ref,
-                    "role": {"text": "supervising"},
-                }
-            ]
-
-    # Set item
-    item: dict[str, Any] = {"sequence": 1}
-
-    if charge_id is not None:
-        item["sequence"] = int(charge_id)
-
-    # Encounter reference
-    if appointment_id:
-        encounter_ref = create_reference("Encounter", appointment_id)
-        if encounter_ref:
-            item["encounter"] = [encounter_ref]
-
-    # Product or service
-    if procedure_code:
-        item["productOrService"] = {
-            "coding": [{"system": "http://snomed.info/sct", "code": procedure_code}]
-        }
-        if line_note:
-            item["productOrService"]["coding"][0]["display"] = line_note
-    else:
-        item["productOrService"] = {"text": "Service"}
-
-    # Quantity
-    if units is not None:
-        item["quantity"] = {"value": float(units)}
-
-    # Unit price
-    if unit_amount is not None:
-        item["unitPrice"] = {"value": float(unit_amount), "currency": "USD"}
-
-    # Net amount
-    if amount is not None:
-        item["net"] = {"value": float(amount), "currency": "USD"}
-
-    # Diagnosis sequence
-    if diagnosis_sequences:
-        item["diagnosisSequence"] = diagnosis_sequences
-
-    # Notes on item
-    item_notes = []
-    if department_id:
-        item_notes.append({"text": f"Department ID: {department_id}"})
-    if fee_schedule_id:
-        item_notes.append({"text": f"Fee Schedule ID: {fee_schedule_id}"})
-    if item_notes:
-        item["note"] = item_notes
-
-    # Transaction ID extension on item
-    if transaction_id:
-        item.setdefault("extension", []).append(
+def _build_adjudications(d: dict):
+    """Build adjudication list based on transaction type."""
+    transaction_type = grab(d, "type")
+    if not transaction_type:
+        return [
             {
-                "url": "http://synthea.tools/StructureDefinition/transaction-id",
-                "valueString": transaction_id,
+                "category": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/adjudication",
+                            "code": "submitted",
+                        }
+                    ]
+                }
+            }
+        ]
+
+    adjudications = []
+    category_coding = {
+        "system": "http://synthea.tools/CodeSystem/claims-transaction-type",
+        "code": str(transaction_type),
+    }
+
+    # Payments
+    payments = grab(d, "payments")
+    if transaction_type == "PAYMENT" and payments is not None:
+        adjudications.append(
+            {
+                "category": {"coding": [category_coding]},
+                "amount": {"value": float(payments), "currency": "USD"},
             }
         )
 
-    resource["item"] = [item]
+    # Adjustments
+    adjustments = grab(d, "adjustments")
+    if transaction_type == "ADJUSTMENT" and adjustments is not None:
+        adjudications.append(
+            {
+                "category": {"coding": [{**category_coding, "code": "adjustment"}]},
+                "amount": {"value": float(adjustments), "currency": "USD"},
+            }
+        )
 
-    # Set notes
-    claim_notes = []
-    if notes:
-        claim_notes.append({"text": notes})
-    if line_note and not procedure_code:  # Only add if not already used as display
-        claim_notes.append({"text": line_note})
-    if claim_notes:
-        resource["note"] = claim_notes
+    # Transfers
+    transfers = grab(d, "transfers")
+    if transaction_type in ("TRANSFERIN", "TRANSFEROUT") and transfers is not None:
+        transfer_adj = {
+            "category": {"coding": [{**category_coding, "code": "transfer"}]},
+            "amount": {"value": float(transfers), "currency": "USD"},
+        }
 
-    return Claim(**resource)
+        transfer_reasons = []
+        transfer_out_id = grab(d, "transferoutid")
+        if transfer_out_id:
+            transfer_reasons.append(f"Transfer Out ID: {transfer_out_id}")
+        transfer_type = grab(d, "transfertype")
+        if transfer_type:
+            transfer_reasons.append(f"Transfer Type: {transfer_type}")
+        if transfer_reasons:
+            transfer_adj["reason"] = {"text": "; ".join(transfer_reasons)}
+
+        adjudications.append(transfer_adj)
+
+    # CHARGE - no adjudication needed, just category
+    if transaction_type == "CHARGE":
+        adjudications.append({"category": {"coding": [category_coding]}})
+
+    # Ensure at least one adjudication
+    if not adjudications:
+        adjudications.append(
+            {
+                "category": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/adjudication",
+                            "code": "submitted",
+                        }
+                    ]
+                }
+            }
+        )
+
+    return adjudications
 
 
-def convert_response(src: ClaimTransaction) -> ClaimResponse:
-    """Convert Synthea ClaimTransaction to FHIR R4 ClaimResponse.
+def _build_response_item(d: dict):
+    """Build ClaimResponse item structure."""
+    charge_id = grab(d, "chargeid")
+    if charge_id is None:
+        return None
 
-    Args:
-        src: Synthea ClaimTransaction model
+    item = {
+        "itemSequence": int(charge_id),
+        "adjudication": _build_adjudications(d),
+    }
 
-    Returns:
-        FHIR R4 ClaimResponse resource
-    """
-    d = src.model_dump()
+    outstanding = grab(d, "outstanding")
+    if outstanding is not None:
+        item["note"] = [{"text": f"Outstanding: {outstanding}"}]
 
-    # Extract and process fields
-    transaction_id = to_str(d.get("id"))
-    claim_id = to_str(d.get("claimid"))
-    patient_id = to_str(d.get("patientid"))
-    patient_insurance_id = to_str(d.get("patientinsuranceid"))
-    transaction_type = to_str(d.get("type"))
-    method = to_str(d.get("method"))
-    to_date = to_str(d.get("todate"))
-    transfer_out_id = to_str(d.get("transferoutid"))
-    transfer_type = to_str(d.get("transfertype"))
+    return [item]
 
-    # Parse numeric fields
-    charge_id = d.get("chargeid")
-    payments = d.get("payments")
-    adjustments = d.get("adjustments")
-    transfers = d.get("transfers")
-    outstanding = d.get("outstanding")
 
-    # Build base resource
-    resource: dict[str, Any] = {
+def _build_payment(d: dict) -> dict | None:
+    """Build payment structure."""
+    transaction_type = grab(d, "type")
+    payments = grab(d, "payments")
+
+    if transaction_type != "PAYMENT" or payments is None:
+        return None
+
+    payment: dict = {"amount": {"value": float(payments), "currency": "USD"}}
+
+    method = grab(d, "method")
+    if method:
+        payment["type"] = {
+            "coding": [
+                {
+                    "system": "http://synthea.tools/CodeSystem/payment-method",
+                    "code": str(method),
+                }
+            ]
+        }
+
+    to_date = grab(d, "todate")
+    if to_date:
+        iso_date = format_datetime(to_date)
+        if iso_date:
+            payment["date"] = iso_date
+
+    return payment
+
+
+@mapper
+def _to_fhir_claim_response(d: dict):
+    """Core mapping from dict to FHIR ClaimResponse structure."""
+    transaction_id = grab(d, "id")
+    patient_insurance_id = grab(d, "patientinsuranceid")
+
+    insurance = None
+    if patient_insurance_id:
+        insurance_ref = ref("Coverage", patient_insurance_id)
+        if insurance_ref:
+            insurance = [{"sequence": 1, "focal": True, "coverage": insurance_ref}]
+
+    return {
         "resourceType": "ClaimResponse",
+        "id": transaction_id,
         "status": "active",
         "use": "claim",
         "type": {
@@ -244,136 +344,34 @@ def convert_response(src: ClaimTransaction) -> ClaimResponse:
             ]
         },
         "outcome": "complete",
+        "request": ref("Claim", grab(d, "claimid")),
+        "patient": ref("Patient", grab(d, "patientid")),
+        "insurer": {"display": "Unknown Insurer"},
+        "insurance": insurance,
+        "item": _build_response_item(d),
+        "payment": _build_payment(d),
     }
 
-    if transaction_id:
-        resource["id"] = transaction_id
 
-    # Set request reference
-    if claim_id:
-        claim_ref = create_reference("Claim", claim_id)
-        if claim_ref:
-            resource["request"] = claim_ref
+def convert(src: ClaimTransaction) -> Claim:
+    """Convert Synthea ClaimTransaction to FHIR R4 Claim.
 
-    # Set patient reference
-    if patient_id:
-        patient_ref = create_reference("Patient", patient_id)
-        if patient_ref:
-            resource["patient"] = patient_ref
+    Args:
+        src: Synthea ClaimTransaction model
 
-    # Set insurer (required in R4B)
-    resource["insurer"] = {"display": "Unknown Insurer"}
+    Returns:
+        FHIR R4 Claim resource (skeleton based on transaction data)
+    """
+    return Claim(**_to_fhir_claim_transaction(to_dict(src)))
 
-    # Set insurance
-    if patient_insurance_id:
-        insurance_ref = create_reference("Coverage", patient_insurance_id)
-        if insurance_ref:
-            resource["insurance"] = [
-                {"sequence": 1, "focal": True, "coverage": insurance_ref}
-            ]
 
-    # Set item with adjudication
-    if charge_id is not None:
-        item: dict[str, Any] = {"itemSequence": int(charge_id), "adjudication": []}
+def convert_response(src: ClaimTransaction) -> ClaimResponse:
+    """Convert Synthea ClaimTransaction to FHIR R4 ClaimResponse.
 
-        # Build adjudications based on transaction type
-        if transaction_type:
-            # Category coding for transaction type
-            category_coding = {
-                "system": "http://synthea.tools/CodeSystem/claims-transaction-type",
-                "code": transaction_type,
-            }
+    Args:
+        src: Synthea ClaimTransaction model
 
-            # Payments
-            if transaction_type == "PAYMENT" and payments is not None:
-                item["adjudication"].append(
-                    {
-                        "category": {"coding": [category_coding]},
-                        "amount": {"value": float(payments), "currency": "USD"},
-                    }
-                )
-
-            # Adjustments
-            if transaction_type == "ADJUSTMENT" and adjustments is not None:
-                item["adjudication"].append(
-                    {
-                        "category": {
-                            "coding": [{**category_coding, "code": "adjustment"}]
-                        },
-                        "amount": {"value": float(adjustments), "currency": "USD"},
-                    }
-                )
-
-            # Transfers
-            if (
-                transaction_type in ("TRANSFERIN", "TRANSFEROUT")
-                and transfers is not None
-            ):
-                transfer_adjudication: dict[str, Any] = {
-                    "category": {"coding": [{**category_coding, "code": "transfer"}]},
-                    "amount": {"value": float(transfers), "currency": "USD"},
-                }
-
-                # Add transfer details as reason
-                transfer_reasons = []
-                if transfer_out_id:
-                    transfer_reasons.append(f"Transfer Out ID: {transfer_out_id}")
-                if transfer_type:
-                    transfer_reasons.append(f"Transfer Type: {transfer_type}")
-
-                if transfer_reasons:
-                    transfer_adjudication["reason"] = {
-                        "text": "; ".join(transfer_reasons)
-                    }
-
-                item["adjudication"].append(transfer_adjudication)
-
-            # CHARGE - no adjudication needed, just category
-            if transaction_type == "CHARGE":
-                item["adjudication"].append({"category": {"coding": [category_coding]}})
-
-        # Outstanding note
-        if outstanding is not None:
-            item["note"] = [{"text": f"Outstanding: {outstanding}"}]
-
-        # Ensure at least one adjudication for valid structure
-        if not item["adjudication"]:
-            item["adjudication"].append(
-                {
-                    "category": {
-                        "coding": [
-                            {
-                                "system": "http://terminology.hl7.org/CodeSystem/adjudication",
-                                "code": "submitted",
-                            }
-                        ]
-                    },
-                }
-            )
-
-        resource["item"] = [item]
-
-    # Set payment
-    if payments is not None and transaction_type == "PAYMENT":
-        payment: dict[str, Any] = {
-            "amount": {"value": float(payments), "currency": "USD"}
-        }
-
-        if method:
-            payment["type"] = {
-                "coding": [
-                    {
-                        "system": "http://synthea.tools/CodeSystem/payment-method",
-                        "code": method,
-                    }
-                ]
-            }
-
-        if to_date:
-            iso_date = format_datetime(to_date)
-            if iso_date:
-                payment["date"] = iso_date
-
-        resource["payment"] = payment
-
-    return ClaimResponse(**resource)
+    Returns:
+        FHIR R4 ClaimResponse resource
+    """
+    return ClaimResponse(**_to_fhir_claim_response(to_dict(src)))

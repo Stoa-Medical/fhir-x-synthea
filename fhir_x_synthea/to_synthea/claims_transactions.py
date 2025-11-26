@@ -7,9 +7,22 @@ from fhir.resources.claim import Claim
 from fhir.resources.claimresponse import ClaimResponse
 from synthea_pydantic import ClaimTransaction
 
-from ..synthea_csv_lib import extract_reference_id, parse_datetime_to_date
+from ..chidian_ext import extract_ref_id, grab, parse_date, to_dict
+from ..synthea_lib import to_decimal
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_supervising_provider(d: dict) -> str:
+    """Extract supervising provider from careTeam."""
+    care_team = grab(d, "careTeam") or []
+    for team_member in care_team:
+        role = team_member.get("role", {})
+        if role.get("text") == "supervising":
+            provider = team_member.get("provider")
+            if provider:
+                return extract_ref_id({"p": provider}, "p")
+    return ""
 
 
 def convert(src: Claim) -> list[ClaimTransaction]:
@@ -23,75 +36,60 @@ def convert(src: Claim) -> list[ClaimTransaction]:
     Returns:
         List of Synthea ClaimTransaction models
     """
-    fhir_resource = src.model_dump(exclude_none=True)
+    d = to_dict(src)
     transactions = []
 
-    claim_id = fhir_resource.get("id", "")
+    claim_id = grab(d, "id") or ""
+    patient_id = extract_ref_id(d, "patient")
+    place_of_service = extract_ref_id(d, "facility")
+    provider_id = extract_ref_id(d, "provider")
 
-    # Extract common fields
-    patient = fhir_resource.get("patient")
-    patient_id = extract_reference_id(patient) if patient else ""
+    # Extract billable period
+    billable_period = grab(d, "billablePeriod") or {}
+    from_date = (
+        parse_date({"dt": billable_period.get("start")}, "dt")
+        if billable_period.get("start")
+        else None
+    )
+    to_date = (
+        parse_date({"dt": billable_period.get("end")}, "dt")
+        if billable_period.get("end")
+        else None
+    )
 
-    facility = fhir_resource.get("facility")
-    place_of_service = extract_reference_id(facility) if facility else ""
-
-    provider = fhir_resource.get("provider")
-    provider_id = extract_reference_id(provider) if provider else ""
-
-    billable_period = fhir_resource.get("billablePeriod", {})
-    from_date_str = billable_period.get("start")
-    to_date_str = billable_period.get("end")
-    from_date = parse_datetime_to_date(from_date_str) if from_date_str else None
-    to_date = parse_datetime_to_date(to_date_str) if to_date_str else None
-
-    insurance_list = fhir_resource.get("insurance", [])
+    # Extract insurance
+    insurance_list = grab(d, "insurance") or []
     patient_insurance_id = ""
     if insurance_list:
-        first_insurance = insurance_list[0]
-        coverage = first_insurance.get("coverage")
+        coverage = insurance_list[0].get("coverage")
         if coverage:
-            patient_insurance_id = extract_reference_id(coverage)
+            patient_insurance_id = extract_ref_id({"c": coverage}, "c")
 
-    care_team = fhir_resource.get("careTeam", [])
-    supervising_provider_id = ""
-    for team_member in care_team:
-        role = team_member.get("role", {})
-        if role.get("text") == "supervising":
-            provider_ref = team_member.get("provider")
-            if provider_ref:
-                supervising_provider_id = extract_reference_id(provider_ref)
-                break
+    supervising_provider_id = _extract_supervising_provider(d)
 
-    notes_list = fhir_resource.get("note", [])
+    # Extract notes
+    notes_list = grab(d, "note") or []
     notes_text = "; ".join(
         [note.get("text", "") for note in notes_list if note.get("text")]
     )
 
     # Process each item
-    items = fhir_resource.get("item", [])
+    items = grab(d, "item") or []
     for item in items:
         charge_id = item.get("sequence")
         if charge_id is None:
             continue
 
-        # Generate transaction ID
         transaction_id = f"txn-{claim_id}-{charge_id}"
 
         # Extract item-specific fields
         net = item.get("net", {})
-        amount = (
-            Decimal(str(net.get("value"))) if net.get("value") is not None else None
-        )
+        amount = to_decimal(net.get("value")) if net.get("value") is not None else None
 
-        procedure_code = ""
         product_or_service = item.get("productOrService", {})
         codings = product_or_service.get("coding", [])
-        if codings:
-            procedure_code = codings[0].get("code", "")
-
-        line_note = ""
-        if codings and codings[0].get("display"):
-            line_note = codings[0].get("display", "")
+        procedure_code = codings[0].get("code", "") if codings else ""
+        line_note = codings[0].get("display", "") if codings else ""
 
         modifiers = item.get("modifier", [])
         modifier1 = modifiers[0].get("code", "") if len(modifiers) > 0 else ""
@@ -113,21 +111,22 @@ def convert(src: Claim) -> list[ClaimTransaction]:
 
         quantity = item.get("quantity", {})
         units = (
-            Decimal(str(quantity.get("value")))
+            to_decimal(quantity.get("value"))
             if quantity.get("value") is not None
             else None
         )
 
         unit_price = item.get("unitPrice", {})
         unit_amount = (
-            Decimal(str(unit_price.get("value")))
+            to_decimal(unit_price.get("value"))
             if unit_price.get("value") is not None
             else None
         )
 
         encounters = item.get("encounter", [])
-        appointment_id = extract_reference_id(encounters[0]) if encounters else ""
+        appointment_id = extract_ref_id({"e": encounters[0]}, "e") if encounters else ""
 
+        # Extract notes
         item_notes = item.get("note", [])
         department_id = ""
         fee_schedule_id = ""
@@ -187,37 +186,27 @@ def convert_response(src: ClaimResponse) -> list[ClaimTransaction]:
     Returns:
         List of Synthea ClaimTransaction models
     """
-    fhir_resource = src.model_dump(exclude_none=True)
+    d = to_dict(src)
     transactions = []
 
-    transaction_id = fhir_resource.get("id", "")
-
-    # Extract request reference (Claim ID)
-    request = fhir_resource.get("request")
-    claim_id = extract_reference_id(request) if request else ""
-
-    # Extract patient
-    patient = fhir_resource.get("patient")
-    patient_id = extract_reference_id(patient) if patient else ""
+    transaction_id = grab(d, "id") or ""
+    claim_id = extract_ref_id(d, "request")
+    patient_id = extract_ref_id(d, "patient")
 
     # Extract payment
-    payment = fhir_resource.get("payment", {})
+    payment = grab(d, "payment") or {}
     payment_amount = payment.get("amount", {}).get("value")
-    payment_method_obj = payment.get("type", {})
-    payment_method = ""
-    codings = payment_method_obj.get("coding", [])
-    if codings:
-        payment_method = codings[0].get("code", "")
-    elif payment_method_obj.get("text"):
-        payment_method = payment_method_obj.get("text", "")
-
-    payment_date_str = payment.get("date")
+    payment_type = payment.get("type", {})
+    codings = payment_type.get("coding", [])
+    payment_method = (
+        codings[0].get("code", "") if codings else payment_type.get("text", "")
+    )
     payment_date = (
-        parse_datetime_to_date(payment_date_str) if payment_date_str else None
+        parse_date({"dt": payment.get("date")}, "dt") if payment.get("date") else None
     )
 
     # Process items
-    items = fhir_resource.get("item", [])
+    items = grab(d, "item") or []
     for item in items:
         charge_id = item.get("itemSequence")
 
@@ -228,36 +217,31 @@ def convert_response(src: ClaimResponse) -> list[ClaimTransaction]:
         transfer_out_id = ""
         transfer_type = ""
 
-        adjudications = item.get("adjudication", [])
-        for adj in adjudications:
+        for adj in item.get("adjudication", []):
             category = adj.get("category", {})
-            adj_codings = category.get("coding", [])
-            for coding in adj_codings:
+            for coding in category.get("coding", []):
                 code = coding.get("code", "")
                 if code in ("PAYMENT", "payment"):
                     transaction_type = "PAYMENT"
                     if adj.get("amount"):
-                        amount_value = Decimal(str(adj["amount"].get("value", 0)))
+                        amount_value = to_decimal(adj["amount"].get("value", 0))
                     break
                 elif code in ("ADJUSTMENT", "adjustment"):
                     transaction_type = "ADJUSTMENT"
                     if adj.get("amount"):
-                        amount_value = Decimal(str(adj["amount"].get("value", 0)))
+                        amount_value = to_decimal(adj["amount"].get("value", 0))
                     break
                 elif code in ("TRANSFERIN", "TRANSFEROUT", "transfer"):
                     transaction_type = (
                         "TRANSFERIN" if "IN" in code.upper() else "TRANSFEROUT"
                     )
                     if adj.get("amount"):
-                        transfers_value = Decimal(str(adj["amount"].get("value", 0)))
+                        transfers_value = to_decimal(adj["amount"].get("value", 0))
 
-                    # Extract transfer details from reason
                     reason = adj.get("reason", {})
                     reason_text = reason.get("text", "")
-
                     if reason_text:
-                        parts = reason_text.split(";")
-                        for part in parts:
+                        for part in reason_text.split(";"):
                             if "Transfer Out ID:" in part:
                                 transfer_out_id = part.replace(
                                     "Transfer Out ID:", ""
@@ -268,15 +252,13 @@ def convert_response(src: ClaimResponse) -> list[ClaimTransaction]:
                                 ).strip()
                     break
 
-        # If payment.amount present, override with PAYMENT
         if payment_amount is not None and not transaction_type:
             transaction_type = "PAYMENT"
-            amount_value = Decimal(str(payment_amount))
+            amount_value = to_decimal(payment_amount)
 
         # Extract outstanding from notes
         outstanding = None
-        item_notes = item.get("note", [])
-        for note in item_notes:
+        for note in item.get("note", []):
             note_text = note.get("text", "")
             if "Outstanding:" in note_text:
                 try:
@@ -308,7 +290,7 @@ def convert_response(src: ClaimResponse) -> list[ClaimTransaction]:
             unitamount=None,
             transferoutid=transfer_out_id or None,
             transfertype=transfer_type or None,
-            payments=Decimal(str(payment_amount))
+            payments=to_decimal(payment_amount)
             if transaction_type == "PAYMENT" and payment_amount is not None
             else None,
             adjustments=amount_value if transaction_type == "ADJUSTMENT" else None,
@@ -351,7 +333,7 @@ def convert_response(src: ClaimResponse) -> list[ClaimTransaction]:
             unitamount=None,
             transferoutid=None,
             transfertype=None,
-            payments=Decimal(str(payment_amount)),
+            payments=to_decimal(payment_amount),
             adjustments=None,
             transfers=None,
             outstanding=None,

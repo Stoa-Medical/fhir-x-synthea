@@ -1,12 +1,72 @@
 """Synthea Provider → FHIR R4 Practitioner"""
 
-from typing import Any
-
 from fhir.resources.practitioner import Practitioner
 from synthea_pydantic import Provider as SyntheaProvider
 
+from ..chidian_ext import grab, mapper, to_dict
 from ..fhir_lib import map_gender, split_name
-from ..utils import to_str
+
+
+def _geolocation_extension(lat: float | None, lon: float | None):
+    """Create geolocation extension if both lat/lon present."""
+    if lat is None or lon is None:
+        return None
+    return {
+        "url": "http://hl7.org/fhir/StructureDefinition/geolocation",
+        "extension": [
+            {"url": "latitude", "valueDecimal": float(lat)},
+            {"url": "longitude", "valueDecimal": float(lon)},
+        ],
+    }
+
+
+def _name(name_str: str | None):
+    """Build FHIR HumanName from name string."""
+    given, family = split_name(name_str)
+    if not given and not family:
+        return None
+    return {
+        "use": "official",
+        "given": [given] if given else None,
+        "family": family,
+    }
+
+
+def _address(d: dict):
+    """Build FHIR Address from source dict."""
+    address = grab(d, "address")
+    city = grab(d, "city")
+    state = grab(d, "state")
+    zip_code = grab(d, "zip")
+    lat = grab(d, "lat")
+    lon = grab(d, "lon")
+
+    if not any([address, city, state, zip_code, lat is not None and lon is not None]):
+        return None
+
+    geo = _geolocation_extension(lat, lon)
+    return {
+        "line": [address] if address else None,
+        "city": city,
+        "state": state,
+        "postalCode": zip_code,
+        "extension": [geo] if geo else None,
+    }
+
+
+@mapper
+def _to_fhir_provider(d: dict):
+    """Core mapping from dict to FHIR Practitioner structure."""
+    name = _name(grab(d, "name"))
+    addr = _address(d)
+
+    return {
+        "resourceType": "Practitioner",
+        "id": grab(d, "id"),
+        "name": [name] if name else None,
+        "gender": grab(d, "gender", apply=map_gender),
+        "address": [addr] if addr else None,
+    }
 
 
 def convert(src: SyntheaProvider) -> Practitioner:
@@ -18,68 +78,4 @@ def convert(src: SyntheaProvider) -> Practitioner:
     Returns:
         FHIR R4 Practitioner resource
     """
-    d = src.model_dump()
-
-    # Extract fields
-    provider_id = to_str(d.get("id"))
-    name = to_str(d.get("name"))
-    gender = to_str(d.get("gender"))
-    address = to_str(d.get("address"))
-    city = to_str(d.get("city"))
-    state = to_str(d.get("state"))
-    zip_code = to_str(d.get("zip"))
-
-    # Handle numeric fields
-    lat = d.get("lat")
-    lon = d.get("lon")
-
-    # Split name
-    given, family = split_name(name)
-
-    # Build resource
-    resource: dict[str, Any] = {"resourceType": "Practitioner"}
-
-    if provider_id:
-        resource["id"] = provider_id
-
-    # Set name
-    if given or family:
-        name_obj: dict[str, Any] = {"use": "official"}
-        if given:
-            name_obj["given"] = [given]
-        if family:
-            name_obj["family"] = family
-        resource["name"] = [name_obj]
-
-    # Set gender
-    mapped_gender = map_gender(gender)
-    if mapped_gender:
-        resource["gender"] = mapped_gender
-
-    # Set address
-    if address or city or state or zip_code or (lat is not None and lon is not None):
-        address_obj: dict[str, Any] = {}
-
-        if address:
-            address_obj["line"] = [address]
-        if city:
-            address_obj["city"] = city
-        if state:
-            address_obj["state"] = state
-        if zip_code:
-            address_obj["postalCode"] = zip_code
-
-        if lat is not None and lon is not None:
-            address_obj.setdefault("extension", []).append(
-                {
-                    "url": "http://hl7.org/fhir/StructureDefinition/geolocation",
-                    "extension": [
-                        {"url": "latitude", "valueDecimal": float(lat)},
-                        {"url": "longitude", "valueDecimal": float(lon)},
-                    ],
-                }
-            )
-
-        resource["address"] = [address_obj]
-
-    return Practitioner(**resource)
+    return Practitioner(**_to_fhir_provider(to_dict(src)))

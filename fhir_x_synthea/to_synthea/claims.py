@@ -2,93 +2,34 @@
 
 import logging
 from datetime import date
-from typing import Any
 
 from fhir.resources.claim import Claim
 from synthea_pydantic import Claim as SyntheaClaim
 
-from ..synthea_csv_lib import (
-    extract_extension_string,
-    extract_reference_id,
-    parse_datetime_to_date,
-)
+from ..chidian_ext import extract_ext, extract_ref_id, grab, mapper, parse_date, to_dict
 
 logger = logging.getLogger(__name__)
 
 
-def _find_event_by_code(events: list[dict[str, Any]], event_code: str) -> date | None:
+def _find_event_by_code(events: list, event_code: str) -> date | None:
     """Find event by type code and return its date."""
     for event in events:
-        event_type = event.get("type", {})
-        codings = event_type.get("coding", [])
+        codings = event.get("type", {}).get("coding", [])
         for coding in codings:
-            code = coding.get("code", "")
-            if code == event_code:
+            if coding.get("code") == event_code:
                 when = event.get("whenDateTime")
                 if when:
-                    parsed = parse_datetime_to_date(when)
+                    parsed = parse_date({"dt": when}, "dt")
                     if parsed:
                         return date.fromisoformat(parsed)
     return None
 
 
-def convert(src: Claim) -> SyntheaClaim:
-    """Convert FHIR R4 Claim to Synthea Claim.
+def _extract_diagnosis_codes(d: dict) -> list[str]:
+    """Extract up to 8 diagnosis codes."""
+    diagnoses = grab(d, "diagnosis") or []
+    codes = [""] * 8
 
-    Args:
-        src: FHIR R4 Claim resource
-
-    Returns:
-        Synthea Claim model
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
-    """
-    fhir_resource = src.model_dump(exclude_none=True)
-
-    # Extract Id
-    resource_id = fhir_resource.get("id", "")
-
-    # Extract Patient ID
-    patient_id = ""
-    patient = fhir_resource.get("patient")
-    if patient:
-        patient_id = extract_reference_id(patient)
-
-    # Extract Provider ID
-    provider_id = ""
-    provider = fhir_resource.get("provider")
-    if provider:
-        provider_id = extract_reference_id(provider)
-
-    # Extract Insurance (Primary and Secondary)
-    primary_insurance_id = ""
-    secondary_insurance_id = ""
-    insurance_list = fhir_resource.get("insurance", [])
-    for i, insurance in enumerate(insurance_list[:2]):
-        coverage = insurance.get("coverage")
-        if coverage:
-            coverage_id = extract_reference_id(coverage)
-            sequence = insurance.get("sequence", i + 1)
-            focal = insurance.get("focal", sequence == 1)
-
-            if sequence == 1 or focal:
-                primary_insurance_id = coverage_id
-            elif sequence == 2 or not focal:
-                secondary_insurance_id = coverage_id
-
-    # Extract Department IDs from extensions
-    department_id = extract_extension_string(
-        fhir_resource, "http://synthea.tools/StructureDefinition/department-id"
-    )
-    patient_department_id = extract_extension_string(
-        fhir_resource, "http://synthea.tools/StructureDefinition/patient-department-id"
-    )
-
-    # Extract Diagnosis codes (up to 8)
-    diagnoses = fhir_resource.get("diagnosis", [])
-    diagnosis_codes = ["", "", "", "", "", "", "", ""]
     for i, diagnosis in enumerate(diagnoses[:8]):
         diagnosis_codeable = diagnosis.get("diagnosisCodeableConcept", {})
         codings = diagnosis_codeable.get("coding", [])
@@ -101,126 +42,159 @@ def convert(src: Claim) -> SyntheaClaim:
                     break
             if not code and codings:
                 code = codings[0].get("code", "")
-            if code:
-                diagnosis_codes[i] = code
+            codes[i] = code
 
-    # Extract Appointment ID from item
-    appointment_id = ""
-    items = fhir_resource.get("item", [])
-    if items:
-        first_item = items[0]
-        encounters = first_item.get("encounter", [])
-        if encounters:
-            first_encounter = encounters[0]
-            appointment_id = extract_reference_id(first_encounter)
+    # Log lossy conversions
+    if len(diagnoses) > 8:
+        logger.warning("Claim has %d diagnoses; only first 8 preserved", len(diagnoses))
+
+    return codes
+
+
+def _extract_insurance(d: dict) -> tuple[str, str]:
+    """Extract primary and secondary insurance IDs."""
+    insurance_list = grab(d, "insurance") or []
+    primary = ""
+    secondary = ""
+
+    for insurance in insurance_list[:2]:
+        coverage = insurance.get("coverage")
+        if coverage:
+            coverage_id = extract_ref_id({"c": coverage}, "c")
+            sequence = insurance.get("sequence", 0)
+            focal = insurance.get("focal", sequence == 1)
+
+            if sequence == 1 or focal:
+                primary = coverage_id
+            elif sequence == 2 or not focal:
+                secondary = coverage_id
+
+    return primary, secondary
+
+
+def _extract_supervising_provider(d: dict) -> str:
+    """Extract supervising provider from careTeam."""
+    care_team = grab(d, "careTeam") or []
+    for team_member in care_team:
+        role = team_member.get("role", {})
+        if role.get("text") == "supervising":
+            provider = team_member.get("provider")
+            if provider:
+                return extract_ref_id({"p": provider}, "p")
+    return ""
+
+
+def _extract_claim_type(d: dict) -> tuple[str, str]:
+    """Extract claim type ID1 and ID2."""
+    claim_type = grab(d, "type") or {}
+    codings = claim_type.get("coding", [])
+    type_id1 = ""
+    for coding in codings:
+        code = coding.get("code", "")
+        if code == "professional":
+            type_id1 = "1"
+        elif code == "institutional":
+            type_id1 = "2"
+        break
+
+    sub_type = grab(d, "subType") or {}
+    sub_codings = sub_type.get("coding", [])
+    type_id2 = sub_codings[0].get("code", "") if sub_codings else ""
+
+    return type_id1, type_id2
+
+
+@mapper(remove_empty=False)
+def _to_synthea_claim(d: dict):
+    """Core mapping from dict to Synthea Claim structure."""
+    diagnosis_codes = _extract_diagnosis_codes(d)
+    primary_insurance, secondary_insurance = _extract_insurance(d)
+    type_id1, type_id2 = _extract_claim_type(d)
 
     # Extract events
-    events = fhir_resource.get("event", [])
+    events = grab(d, "event") or []
     current_illness_date = _find_event_by_code(events, "onset")
     last_billed_date1 = _find_event_by_code(events, "bill-primary")
     last_billed_date2 = _find_event_by_code(events, "bill-secondary")
     last_billed_datep = _find_event_by_code(events, "bill-patient")
 
-    # Extract Service Date from billablePeriod
+    # Extract service date from billablePeriod
+    billable_period = grab(d, "billablePeriod") or {}
     service_date = None
-    billable_period = fhir_resource.get("billablePeriod", {})
     start = billable_period.get("start")
     end = billable_period.get("end")
     if start:
-        parsed = parse_datetime_to_date(start)
+        parsed = parse_date({"dt": start}, "dt")
         if parsed:
             service_date = date.fromisoformat(parsed)
     elif end:
-        parsed = parse_datetime_to_date(end)
+        parsed = parse_date({"dt": end}, "dt")
         if parsed:
             service_date = date.fromisoformat(parsed)
 
-    # Extract Supervising Provider from careTeam
-    supervising_provider_id = ""
-    care_team = fhir_resource.get("careTeam", [])
-    for team_member in care_team:
-        role = team_member.get("role", {})
-        role_text = role.get("text", "")
-        if role_text == "supervising":
-            provider_ref = team_member.get("provider")
-            if provider_ref:
-                supervising_provider_id = extract_reference_id(provider_ref)
-                break
+    # Extract appointment ID from item
+    appointment_id = ""
+    items = grab(d, "item") or []
+    if items:
+        encounters = items[0].get("encounter", [])
+        if encounters:
+            appointment_id = extract_ref_id({"e": encounters[0]}, "e")
 
-    # Extract Claim Type
-    healthcare_claim_type_id1 = ""
-    healthcare_claim_type_id2 = ""
-    claim_type = fhir_resource.get("type", {})
-    type_codings = claim_type.get("coding", [])
-    for coding in type_codings:
-        code = coding.get("code", "")
-        if code == "professional":
-            healthcare_claim_type_id1 = "1"
-        elif code == "institutional":
-            healthcare_claim_type_id1 = "2"
-        break
-
-    # Extract SubType
-    sub_type = fhir_resource.get("subType", {})
-    sub_type_codings = sub_type.get("coding", [])
-    if sub_type_codings:
-        healthcare_claim_type_id2 = sub_type_codings[0].get("code", "")
-
-    # Note: Status1/Status2/StatusP and Outstanding1/2/P from notes
-    # These would need parsing from note text if present
-    status1 = ""
-    status2 = ""
-    statusp = ""
-    outstanding1 = ""
-    outstanding2 = ""
-    outstandingp = ""
-
-    notes = fhir_resource.get("note", [])
-    for note in notes:
-        text = note.get("text", "")
-        if text.startswith("Outstanding:"):
-            # This is a simplified extraction
-            pass
-
-    # Log lossy conversions
-    if len(diagnoses) > 8:
-        logger.warning(
-            "Claim %s has %d diagnoses; only first 8 preserved",
-            src.id,
-            len(diagnoses),
+    return {
+        "id": grab(d, "id") or None,
+        "patientid": extract_ref_id(d, "patient") or None,
+        "providerid": extract_ref_id(d, "provider") or None,
+        "primarypatientinsuranceid": primary_insurance or None,
+        "secondarypatientinsuranceid": secondary_insurance or None,
+        "departmentid": extract_ext(
+            d,
+            "http://synthea.tools/StructureDefinition/department-id",
+            "valueString",
+            "",
         )
+        or None,
+        "patientdepartmentid": extract_ext(
+            d,
+            "http://synthea.tools/StructureDefinition/patient-department-id",
+            "valueString",
+            "",
+        )
+        or None,
+        "diagnosis1": diagnosis_codes[0] or None,
+        "diagnosis2": diagnosis_codes[1] or None,
+        "diagnosis3": diagnosis_codes[2] or None,
+        "diagnosis4": diagnosis_codes[3] or None,
+        "diagnosis5": diagnosis_codes[4] or None,
+        "diagnosis6": diagnosis_codes[5] or None,
+        "diagnosis7": diagnosis_codes[6] or None,
+        "diagnosis8": diagnosis_codes[7] or None,
+        "referringproviderid": None,
+        "appointmentid": appointment_id or None,
+        "currentillnessdate": current_illness_date,
+        "servicedate": service_date,
+        "supervisingproviderid": _extract_supervising_provider(d) or None,
+        "status1": None,
+        "status2": None,
+        "statusp": None,
+        "outstanding1": None,
+        "outstanding2": None,
+        "outstandingp": None,
+        "lastbilleddate1": last_billed_date1,
+        "lastbilleddate2": last_billed_date2,
+        "lastbilleddatep": last_billed_datep,
+        "healthcareclaimtypeid1": type_id1 or None,
+        "healthcareclaimtypeid2": type_id2 or None,
+        "healthcareclaimtypeidp": None,
+    }
 
-    return SyntheaClaim(
-        id=resource_id or None,
-        patientid=patient_id or None,
-        providerid=provider_id or None,
-        primarypatientinsuranceid=primary_insurance_id or None,
-        secondarypatientinsuranceid=secondary_insurance_id or None,
-        departmentid=department_id or None,
-        patientdepartmentid=patient_department_id or None,
-        diagnosis1=diagnosis_codes[0] or None,
-        diagnosis2=diagnosis_codes[1] or None,
-        diagnosis3=diagnosis_codes[2] or None,
-        diagnosis4=diagnosis_codes[3] or None,
-        diagnosis5=diagnosis_codes[4] or None,
-        diagnosis6=diagnosis_codes[5] or None,
-        diagnosis7=diagnosis_codes[6] or None,
-        diagnosis8=diagnosis_codes[7] or None,
-        referringproviderid=None,  # Not in FHIR Claim
-        appointmentid=appointment_id or None,
-        currentillnessdate=current_illness_date,
-        servicedate=service_date,
-        supervisingproviderid=supervising_provider_id or None,
-        status1=status1 or None,
-        status2=status2 or None,
-        statusp=statusp or None,
-        outstanding1=outstanding1 or None,
-        outstanding2=outstanding2 or None,
-        outstandingp=outstandingp or None,
-        lastbilleddate1=last_billed_date1,
-        lastbilleddate2=last_billed_date2,
-        lastbilleddatep=last_billed_datep,
-        healthcareclaimtypeid1=healthcare_claim_type_id1 or None,
-        healthcareclaimtypeid2=healthcare_claim_type_id2 or None,
-        healthcareclaimtypeidp=None,  # Not commonly used
-    )
+
+def convert(src: Claim) -> SyntheaClaim:
+    """Convert FHIR R4 Claim to Synthea Claim.
+
+    Args:
+        src: FHIR R4 Claim resource
+
+    Returns:
+        Synthea Claim model
+    """
+    return SyntheaClaim(**_to_synthea_claim(to_dict(src)))

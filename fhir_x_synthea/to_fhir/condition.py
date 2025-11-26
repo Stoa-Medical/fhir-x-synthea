@@ -1,15 +1,84 @@
 """Synthea Condition → FHIR R4 Condition"""
 
-from typing import Any
-
 from fhir.resources.condition import Condition
 from synthea_pydantic import Condition as SyntheaCondition
 
+from ..chidian_ext import grab, mapper, to_dict
 from ..fhir_lib import (
-    create_clinical_status_coding,
+    clinical_status,
+    codeable_concept,
     format_datetime,
+    ref,
+    verification_status,
 )
-from ..utils import to_str
+
+
+def _condition_id(d: dict) -> str:
+    """Generate deterministic condition ID from patient+start+code."""
+    patient_id = grab(d, "patient") or ""
+    start = grab(d, "start") or ""
+    code = grab(d, "code") or ""
+    return f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
+
+
+@mapper
+def _to_fhir_condition(
+    d: dict,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+):
+    """Core mapping from dict to FHIR Condition structure."""
+    patient_id = grab(d, "patient")
+    encounter_id = grab(d, "encounter")
+    stop = grab(d, "stop")
+
+    # Use override refs or build from source IDs
+    effective_patient_ref = patient_ref or (
+        f"Patient/{patient_id}" if patient_id else None
+    )
+    effective_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+
+    return {
+        "resourceType": "Condition",
+        "id": _condition_id(d),
+        "clinicalStatus": clinical_status(
+            is_active=not stop,
+            system="http://terminology.hl7.org/CodeSystem/condition-clinical",
+        ),
+        "verificationStatus": verification_status(
+            code="confirmed",
+            system="http://terminology.hl7.org/CodeSystem/condition-ver-status",
+        ),
+        "category": [
+            {
+                "coding": [
+                    {
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                        "code": "encounter-diagnosis",
+                        "display": "Encounter Diagnosis",
+                    }
+                ]
+            }
+        ],
+        "code": codeable_concept(
+            system="http://snomed.info/sct",
+            code=grab(d, "code"),
+            display=grab(d, "description"),
+            text=grab(d, "description"),
+        ),
+        "subject": ref(
+            "Patient",
+            effective_patient_ref.split("/")[-1] if effective_patient_ref else None,
+        ),
+        "encounter": ref(
+            "Encounter",
+            effective_encounter_ref.split("/")[-1] if effective_encounter_ref else None,
+        ),
+        "onsetDateTime": grab(d, "start", apply=format_datetime),
+        "abatementDateTime": grab(d, "stop", apply=format_datetime),
+    }
 
 
 def convert(
@@ -28,89 +97,4 @@ def convert(
     Returns:
         FHIR R4 Condition resource
     """
-    d = src.model_dump()
-
-    # Extract and process fields (synthea_pydantic uses lowercase keys)
-    start = to_str(d.get("start"))
-    stop = to_str(d.get("stop"))
-    patient_id = to_str(d.get("patient"))
-    encounter_id = to_str(d.get("encounter"))
-    code = to_str(d.get("code"))
-    description = to_str(d.get("description"))
-
-    # Determine clinical status based on stop field
-    is_active = not stop
-    clinical_status = create_clinical_status_coding(
-        is_active, "http://terminology.hl7.org/CodeSystem/condition-clinical"
-    )
-
-    # Generate resource ID from patient+start+code
-    resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
-
-    # Build base resource
-    resource: dict[str, Any] = {
-        "resourceType": "Condition",
-        "id": resource_id,
-        "clinicalStatus": clinical_status,
-        "verificationStatus": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
-                    "code": "confirmed",
-                    "display": "Confirmed",
-                }
-            ]
-        },
-        "category": [
-            {
-                "coding": [
-                    {
-                        "system": "http://terminology.hl7.org/CodeSystem/condition-category",
-                        "code": "encounter-diagnosis",
-                        "display": "Encounter Diagnosis",
-                    }
-                ]
-            }
-        ],
-    }
-
-    # Set onsetDateTime from start
-    if start:
-        iso_start = format_datetime(start)
-        if iso_start:
-            resource["onsetDateTime"] = iso_start
-
-    # Set abatementDateTime from stop if present
-    if stop:
-        iso_stop = format_datetime(stop)
-        if iso_stop:
-            resource["abatementDateTime"] = iso_stop
-
-    # Set subject (patient) reference - use override or from source
-    effective_patient_ref = patient_ref or (
-        f"Patient/{patient_id}" if patient_id else None
-    )
-    if effective_patient_ref:
-        resource["subject"] = {"reference": effective_patient_ref}
-
-    # Set encounter reference - use override or from source
-    effective_encounter_ref = encounter_ref or (
-        f"Encounter/{encounter_id}" if encounter_id else None
-    )
-    if effective_encounter_ref:
-        resource["encounter"] = {"reference": effective_encounter_ref}
-
-    # Set code (SNOMED CT)
-    if code or description:
-        code_obj: dict[str, Any] = {}
-        if code:
-            coding = {"system": "http://snomed.info/sct", "code": code}
-            if description:
-                coding["display"] = description
-            code_obj["coding"] = [coding]
-        if description:
-            code_obj["text"] = description
-        if code_obj:
-            resource["code"] = code_obj
-
-    return Condition(**resource)
+    return Condition(**_to_fhir_condition(to_dict(src), patient_ref, encounter_ref))

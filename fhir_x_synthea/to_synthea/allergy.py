@@ -5,15 +5,119 @@ import logging
 from fhir.resources.allergyintolerance import AllergyIntolerance
 from synthea_pydantic import Allergy
 
-from ..synthea_csv_lib import (
-    extract_coding_code,
-    extract_coding_system,
-    extract_display_or_text,
-    extract_reference_id,
-    parse_datetime,
+from ..chidian_ext import (
+    coalesce,
+    extract_code,
+    extract_display,
+    extract_ref_id,
+    extract_system,
+    grab,
+    mapper,
+    parse_dt,
+    to_datetime,
+    to_dict,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_allergy_type(d: dict) -> str | None:
+    """Extract allergy type from CodeableConcept or string."""
+    type_obj = grab(d, "type")
+    if not type_obj:
+        return None
+
+    if isinstance(type_obj, dict):
+        return (
+            extract_code(
+                {"type": type_obj},
+                "type",
+                system="http://hl7.org/fhir/allergy-intolerance-type",
+            )
+            or None
+        )
+    elif isinstance(type_obj, str):
+        return type_obj.lower() or None
+
+    return None
+
+
+def _extract_category(d: dict) -> str | None:
+    """Extract first category."""
+    categories = grab(d, "category") or []
+    if categories and isinstance(categories[0], str):
+        return categories[0]
+    return None
+
+
+def _extract_reaction(d: dict, idx: int) -> tuple[str, str, str]:
+    """Extract reaction code, description, and severity for reaction at index."""
+    reactions = grab(d, "reaction") or []
+    if idx >= len(reactions):
+        return "", "", ""
+
+    r = reactions[idx]
+    manifestations = r.get("manifestation", [])
+
+    code = ""
+    if manifestations:
+        # R4B uses concept inside manifestation
+        first_manif = manifestations[0]
+        if "concept" in first_manif:
+            code = extract_code(
+                {"m": first_manif["concept"]}, "m", system="http://snomed.info/sct"
+            )
+        else:
+            code = extract_code(
+                {"m": first_manif}, "m", system="http://snomed.info/sct"
+            )
+
+    description = r.get("description", "")
+    severity = (r.get("severity") or "").upper()
+
+    return code, description, severity
+
+
+@mapper(remove_empty=False)
+def _to_synthea_allergy(d: dict):
+    """Core mapping from dict to Synthea Allergy structure."""
+    r1_code, r1_desc, r1_sev = _extract_reaction(d, 0)
+    r2_code, r2_desc, r2_sev = _extract_reaction(d, 1)
+
+    # Log lossy conversions
+    reactions = grab(d, "reaction") or []
+    if len(reactions) > 2:
+        logger.warning(
+            "AllergyIntolerance has %d reactions; only first 2 preserved",
+            len(reactions),
+        )
+
+    return {
+        "start": coalesce(d, "recordedDate", "onsetDateTime", apply=to_datetime)
+        or None,
+        "stop": parse_dt(d, "lastOccurrence") or None,
+        "patient": extract_ref_id(d, "patient") or None,
+        "encounter": extract_ref_id(d, "encounter") or None,
+        "code": extract_code(
+            d,
+            "code",
+            systems=[
+                "http://snomed.info/sct",
+                "http://www.nlm.nih.gov/research/umls/rxnorm",
+            ],
+        )
+        or None,
+        "system": extract_system(d, "code") or None,
+        "description": extract_display(d, "code") or None,
+        "type": _extract_allergy_type(d),
+        "category": _extract_category(d),
+        "reaction1": r1_code or None,
+        "description1": r1_desc or None,
+        "severity1": r1_sev or None,
+        "reaction2": r2_code or None,
+        "description2": r2_desc or None,
+        "severity2": r2_sev or None,
+    }
 
 
 def convert(src: AllergyIntolerance) -> Allergy:
@@ -24,134 +128,5 @@ def convert(src: AllergyIntolerance) -> Allergy:
 
     Returns:
         Synthea Allergy model
-
-    Note:
-        Some FHIR fields may not be representable in Synthea format.
-        Check logs for warnings about dropped data.
     """
-    # Convert to dict for extraction helpers
-    fhir_resource = src.model_dump(exclude_none=True)
-
-    # Extract START (prefer recordedDate, fallback to onsetDateTime)
-    start = ""
-    recorded_date = fhir_resource.get("recordedDate")
-    onset_date = fhir_resource.get("onsetDateTime")
-    if recorded_date:
-        start = parse_datetime(recorded_date)
-    elif onset_date:
-        start = parse_datetime(onset_date)
-
-    # Extract STOP (lastOccurrence)
-    stop = ""
-    last_occurrence = fhir_resource.get("lastOccurrence")
-    if last_occurrence:
-        stop = parse_datetime(last_occurrence)
-
-    # Extract PATIENT reference
-    patient = ""
-    patient_ref = fhir_resource.get("patient")
-    if patient_ref:
-        patient = extract_reference_id(patient_ref)
-
-    # Extract ENCOUNTER reference
-    encounter = ""
-    encounter_ref = fhir_resource.get("encounter")
-    if encounter_ref:
-        encounter = extract_reference_id(encounter_ref)
-
-    # Extract CODE, SYSTEM, DESCRIPTION from code
-    code = ""
-    system = ""
-    description = ""
-    code_obj = fhir_resource.get("code")
-    if code_obj:
-        code = extract_coding_code(
-            code_obj,
-            preferred_systems=[
-                "http://snomed.info/sct",
-                "http://www.nlm.nih.gov/research/umls/rxnorm",
-            ],
-        )
-        system = extract_coding_system(code_obj)
-        description = extract_display_or_text(code_obj)
-
-    # Extract TYPE (R4B uses CodeableConcept for type)
-    allergy_type = ""
-    type_obj = fhir_resource.get("type")
-    if type_obj:
-        if isinstance(type_obj, dict):
-            # Extract code from CodeableConcept
-            allergy_type = extract_coding_code(
-                type_obj,
-                preferred_systems=["http://hl7.org/fhir/allergy-intolerance-type"],
-            )
-        elif isinstance(type_obj, str):
-            allergy_type = type_obj.lower()
-
-    # Extract CATEGORY
-    category = ""
-    categories = fhir_resource.get("category", [])
-    if categories:
-        first_category = categories[0]
-        if isinstance(first_category, str):
-            category = first_category
-
-    # Extract reactions
-    reaction1 = ""
-    description1 = ""
-    severity1 = ""
-    reaction2 = ""
-    description2 = ""
-    severity2 = ""
-
-    reactions = fhir_resource.get("reaction", [])
-    if len(reactions) > 0:
-        r1 = reactions[0]
-        manifestations = r1.get("manifestation", [])
-        if manifestations:
-            reaction1 = extract_coding_code(
-                manifestations[0], preferred_systems=["http://snomed.info/sct"]
-            )
-        description1 = r1.get("description", "")
-        sev = r1.get("severity", "")
-        if sev:
-            severity1 = sev.upper()
-
-    if len(reactions) > 1:
-        r2 = reactions[1]
-        manifestations = r2.get("manifestation", [])
-        if manifestations:
-            reaction2 = extract_coding_code(
-                manifestations[0], preferred_systems=["http://snomed.info/sct"]
-            )
-        description2 = r2.get("description", "")
-        sev = r2.get("severity", "")
-        if sev:
-            severity2 = sev.upper()
-
-    # Log lossy conversions
-    if len(reactions) > 2:
-        logger.warning(
-            "AllergyIntolerance %s has %d reactions; only first 2 preserved",
-            src.id,
-            len(reactions),
-        )
-
-    # Use lowercase field names (synthea_pydantic accepts both but normalizes to lowercase)
-    return Allergy(
-        start=start or None,
-        stop=stop or None,
-        patient=patient or None,
-        encounter=encounter or None,
-        code=code or None,
-        system=system or None,
-        description=description or None,
-        type=allergy_type or None,
-        category=category or None,
-        reaction1=reaction1 or None,
-        description1=description1 or None,
-        severity1=severity1 or None,
-        reaction2=reaction2 or None,
-        description2=description2 or None,
-        severity2=severity2 or None,
-    )
+    return Allergy(**_to_synthea_allergy(to_dict(src)))

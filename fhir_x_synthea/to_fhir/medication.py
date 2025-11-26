@@ -1,120 +1,43 @@
 """Synthea Medication → FHIR R4 MedicationRequest"""
 
-from typing import Any
-
 from fhir.resources.medicationrequest import MedicationRequest
 from synthea_pydantic import Medication as SyntheaMedication
 
-from ..fhir_lib import format_datetime
-from ..utils import to_str
+from ..chidian_ext import grab, mapper, to_dict
+from ..fhir_lib import codeable_concept, format_datetime, ref
 
 
-def convert(
-    src: SyntheaMedication,
-    *,
-    patient_ref: str | None = None,
-    encounter_ref: str | None = None,
-) -> MedicationRequest:
-    """Convert Synthea Medication to FHIR R4 MedicationRequest.
+def _medication_id(d: dict) -> str:
+    """Generate deterministic medication ID."""
+    patient_id = grab(d, "patient") or ""
+    start = grab(d, "start") or ""
+    code = grab(d, "code") or ""
+    return f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
 
-    Args:
-        src: Synthea Medication model
-        patient_ref: Optional patient reference (e.g., "Patient/123")
-        encounter_ref: Optional encounter reference (e.g., "Encounter/456")
 
-    Returns:
-        FHIR R4 MedicationRequest resource
-    """
-    d = src.model_dump()
+def _reason(reason_code: str | None, reason_desc: str | None) -> list | None:
+    """Build medication reason (CodeableReference)."""
+    if not reason_code and not reason_desc:
+        return None
 
-    # Extract fields
-    start = to_str(d.get("start"))
-    stop = to_str(d.get("stop"))
-    patient_id = to_str(d.get("patient"))
-    encounter_id = to_str(d.get("encounter"))
-    payer_id = to_str(d.get("payer"))
-    code = to_str(d.get("code"))
-    description = to_str(d.get("description"))
-    dispenses = d.get("dispenses")
-    reason_code = to_str(d.get("reasoncode"))
-    reason_description = to_str(d.get("reasondescription"))
-    base_cost = d.get("base_cost")
-    payer_coverage = d.get("payer_coverage")
-    total_cost = d.get("totalcost")
+    concept: dict = {}
+    if reason_code:
+        coding = {"system": "http://snomed.info/sct", "code": reason_code}
+        if reason_desc:
+            coding["display"] = reason_desc
+        concept["coding"] = [coding]
+    if reason_desc:
+        concept["text"] = reason_desc
 
-    # Determine status
-    status = "active" if not stop else "completed"
+    return [{"concept": concept}] if concept else None
 
-    # Generate resource ID
-    resource_id = f"{patient_id}-{start}-{code}".replace(" ", "-").replace(":", "-")
 
-    # Build resource
-    resource: dict[str, Any] = {
-        "resourceType": "MedicationRequest",
-        "id": resource_id,
-        "status": status,
-        "intent": "order",
-    }
+def _financial_extensions(d: dict):
+    """Build financial extensions."""
+    base_cost = grab(d, "base_cost")
+    payer_coverage = grab(d, "payer_coverage")
+    total_cost = grab(d, "totalcost")
 
-    # Set authoredOn
-    if start:
-        iso_start = format_datetime(start)
-        if iso_start:
-            resource["authoredOn"] = iso_start
-
-    # Set subject reference
-    effective_patient_ref = patient_ref or (
-        f"Patient/{patient_id}" if patient_id else None
-    )
-    if effective_patient_ref:
-        resource["subject"] = {"reference": effective_patient_ref}
-
-    # Set encounter reference
-    effective_encounter_ref = encounter_ref or (
-        f"Encounter/{encounter_id}" if encounter_id else None
-    )
-    if effective_encounter_ref:
-        resource["encounter"] = {"reference": effective_encounter_ref}
-
-    # Set insurance reference
-    if payer_id:
-        resource["insurance"] = [{"reference": f"Coverage/{payer_id}"}]
-
-    # Set medication (RxNorm)
-    if code or description:
-        medication_code: dict[str, Any] = {}
-        if code:
-            medication_code["coding"] = [
-                {
-                    "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-                    "code": code,
-                    "display": description or None,
-                }
-            ]
-        if description:
-            medication_code["text"] = description
-        resource["medication"] = {"concept": medication_code}
-
-    # Set dispense request
-    if dispenses is not None:
-        resource["dispenseRequest"] = {"numberOfRepeatsAllowed": int(dispenses)}
-
-    # Set reason (R4B uses reason with CodeableReference)
-    if reason_code or reason_description:
-        concept: dict[str, Any] = {}
-        if reason_code:
-            concept["coding"] = [
-                {
-                    "system": "http://snomed.info/sct",
-                    "code": reason_code,
-                    "display": reason_description or None,
-                }
-            ]
-        if reason_description:
-            concept["text"] = reason_description
-        resource["reason"] = [{"concept": concept}]
-
-    # Set financial extensions
     extensions = []
     if base_cost is not None:
         extensions.append(
@@ -137,7 +60,75 @@ def convert(
                 "valueDecimal": float(total_cost),
             }
         )
-    if extensions:
-        resource["extension"] = extensions
 
-    return MedicationRequest(**resource)
+    return extensions if extensions else None
+
+
+@mapper
+def _to_fhir_medication(
+    d: dict,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+):
+    """Core mapping from dict to FHIR MedicationRequest structure."""
+    patient_id = grab(d, "patient")
+    encounter_id = grab(d, "encounter")
+    payer_id = grab(d, "payer")
+    stop = grab(d, "stop")
+    dispenses = grab(d, "dispenses")
+
+    # Build effective references
+    eff_patient_ref = patient_ref or (f"Patient/{patient_id}" if patient_id else None)
+    eff_encounter_ref = encounter_ref or (
+        f"Encounter/{encounter_id}" if encounter_id else None
+    )
+
+    # Build medication CodeableConcept
+    med_code = codeable_concept(
+        system="http://www.nlm.nih.gov/research/umls/rxnorm",
+        code=grab(d, "code"),
+        display=grab(d, "description"),
+        text=grab(d, "description"),
+    )
+
+    return {
+        "resourceType": "MedicationRequest",
+        "id": _medication_id(d),
+        "status": "completed" if stop else "active",
+        "intent": "order",
+        "medication": {"concept": med_code} if med_code else None,
+        "subject": ref(
+            "Patient", eff_patient_ref.split("/")[-1] if eff_patient_ref else None
+        ),
+        "encounter": ref(
+            "Encounter", eff_encounter_ref.split("/")[-1] if eff_encounter_ref else None
+        ),
+        "authoredOn": grab(d, "start", apply=format_datetime),
+        "insurance": [{"reference": f"Coverage/{payer_id}"}] if payer_id else None,
+        "dispenseRequest": {"numberOfRepeatsAllowed": int(dispenses)}
+        if dispenses is not None
+        else None,
+        "reason": _reason(grab(d, "reasoncode"), grab(d, "reasondescription")),
+        "extension": _financial_extensions(d),
+    }
+
+
+def convert(
+    src: SyntheaMedication,
+    *,
+    patient_ref: str | None = None,
+    encounter_ref: str | None = None,
+) -> MedicationRequest:
+    """Convert Synthea Medication to FHIR R4 MedicationRequest.
+
+    Args:
+        src: Synthea Medication model
+        patient_ref: Optional patient reference (e.g., "Patient/123")
+        encounter_ref: Optional encounter reference (e.g., "Encounter/456")
+
+    Returns:
+        FHIR R4 MedicationRequest resource
+    """
+    return MedicationRequest(
+        **_to_fhir_medication(to_dict(src), patient_ref, encounter_ref)
+    )

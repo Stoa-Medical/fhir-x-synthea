@@ -124,7 +124,7 @@ def map_fhir_imaging_study_to_csv(
                         sop_code_raw = sop_class.get("text", "")
                         sop_code = normalize_sop_code(sop_code_raw)
 
-                row: dict[str, str] = {
+                row = {
                     "Id": study_id,
                     "Date": date_str,
                     "Patient": patient_id,
@@ -143,7 +143,7 @@ def map_fhir_imaging_study_to_csv(
 
     # If no series, return at least one row with common fields
     if not rows:
-        row: dict[str, str] = {
+        row = {
             "Id": study_id,
             "Date": date_str,
             "Patient": patient_id,

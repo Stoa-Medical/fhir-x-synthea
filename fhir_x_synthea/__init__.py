@@ -7,6 +7,6 @@ bidirectional semantic data transformations in healthcare.
 
 __version__ = "0.1.0"
 
-from . import fhir_mappers, synthea_csv_mappers
+from . import to_fhir, to_synthea
 
-__all__ = ["fhir_mappers", "synthea_csv_mappers"]
+__all__ = ["to_fhir", "to_synthea"]

@@ -124,7 +124,7 @@ def map_observation(csv_row: dict[str, Any]) -> dict[str, Any]:
         try:
             numeric_value = float(value_str)
             # Use valueQuantity if numeric
-            quantity = {"value": numeric_value}
+            quantity: dict[str, Any] = {"value": numeric_value}
             if units:
                 quantity["unit"] = units
                 quantity["code"] = units

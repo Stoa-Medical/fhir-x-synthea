@@ -165,7 +165,7 @@ def map_encounter(csv_row: dict[str, Any]) -> dict[str, Any]:
             resource["reasonCode"] = [reason_code_obj]
 
     # Set extensions for payer and costs
-    extensions = []
+    extensions: list[dict[str, Any]] = []
 
     # Payer extension
     if payer_id:

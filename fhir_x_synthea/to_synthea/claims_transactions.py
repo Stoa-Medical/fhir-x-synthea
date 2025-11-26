@@ -318,7 +318,7 @@ def map_fhir_claim_response_to_transactions(
 
     # If no items, create one row from payment info
     if not rows and payment_amount is not None:
-        row: dict[str, str] = {
+        row = {
             "Id": transaction_id,
             "Claim ID": claim_id,
             "Charge ID": "",

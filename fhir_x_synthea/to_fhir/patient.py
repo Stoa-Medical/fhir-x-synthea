@@ -184,7 +184,7 @@ def map_patient(csv_row: dict[str, Any]) -> dict[str, Any]:
         resource["maritalStatus"] = marital_status
 
     # Set extensions (Race, Ethnicity, Birthplace)
-    extensions = []
+    extensions: list[dict[str, Any]] = []
 
     # Race extension (US Core)
     if race:

@@ -24,7 +24,7 @@ def map_coverage(csv_row: dict[str, Any]) -> dict[str, Any]:
         if not ownership_str:
             return None
         ownership_lower = ownership_str.lower().strip()
-        relationship_map = {
+        relationship_map: dict[str, dict[str, Any]] = {
             "self": {
                 "coding": [
                     {

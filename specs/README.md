@@ -30,5 +30,6 @@ Brief description of the semantic entity and scope of this mapping.
 ```
 
 ## Directory Structure
-- `to_fhir/` - Synthea CSV → FHIR mappings  
-- `to_synthea_csv/` - FHIR → Synthea CSV mappings
+- `to_fhir/` — Synthea CSV → FHIR mappings (core: patient, encounter, condition, allergy)
+- `to_synthea/` — FHIR → Synthea CSV mappings (core: patient, encounter, condition, allergy)
+- `_staged/` — Specs for additional resource types not yet wired into orchestration

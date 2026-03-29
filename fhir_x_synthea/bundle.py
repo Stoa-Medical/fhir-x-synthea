@@ -8,10 +8,7 @@ from synthea_pydantic import (
     Patient,
 )
 
-from .to_fhir import allergy as allergy_to_fhir
-from .to_fhir import condition as condition_to_fhir
-from .to_fhir import encounter as encounter_to_fhir
-from .to_fhir import patient as patient_to_fhir
+from .registry import get_converter
 
 
 def patient_bundle(
@@ -43,6 +40,11 @@ def patient_bundle(
     encounters = encounters or []
     conditions = conditions or []
     allergies = allergies or []
+
+    patient_to_fhir = get_converter("to_fhir", "patient")
+    encounter_to_fhir = get_converter("to_fhir", "encounter")
+    condition_to_fhir = get_converter("to_fhir", "condition")
+    allergy_to_fhir = get_converter("to_fhir", "allergy")
 
     entries: list[BundleEntry] = []
 

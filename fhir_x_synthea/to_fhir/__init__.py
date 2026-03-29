@@ -1,12 +1,8 @@
 """
-Synthea → FHIR R4 conversion modules.
+Synthea -> FHIR R4 conversion modules.
 
 Each module exposes a `convert` function for transforming Synthea models to FHIR resources.
-
-Core resources (wired into bundle/extract orchestration):
-    patient, encounter, condition, allergy
-
-Additional converters are staged in _staged/ for future integration.
+All converters are registered in the registry for programmatic discovery.
 
 Usage:
     from fhir_x_synthea.to_fhir import patient
@@ -15,14 +11,42 @@ Usage:
 
 from fhir_x_synthea.to_fhir import (
     allergy,
+    careplan,
+    claims,
+    claims_transactions,
     condition,
+    device,
     encounter,
+    imaging_study,
+    immunization,
+    medication,
+    observation,
+    organization,
     patient,
+    payer,
+    payer_transitions,
+    procedure,
+    provider,
+    supply,
 )
 
 __all__ = [
     "allergy",
+    "careplan",
+    "claims",
+    "claims_transactions",
     "condition",
+    "device",
     "encounter",
+    "imaging_study",
+    "immunization",
+    "medication",
+    "observation",
+    "organization",
     "patient",
+    "payer",
+    "payer_transitions",
+    "procedure",
+    "provider",
+    "supply",
 ]
